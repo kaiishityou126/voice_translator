@@ -257,7 +257,7 @@ mod platform {
     use screencapturekit::prelude::{
         CMSampleBuffer, CMSampleBufferExt, SCStreamOutputTrait, SCStreamOutputType,
     };
-    use tauri::{AppHandle, Emitter};
+    use tauri::{AppHandle, Emitter, Manager};
 
     struct Resampler {
         ratio: f64,
@@ -549,7 +549,7 @@ mod platform {
 
     use anyhow::{anyhow, bail, Result};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use tauri::{AppHandle, Emitter};
+    use tauri::{AppHandle, Emitter, Manager};
 
     struct Resampler {
         ratio: f64,
