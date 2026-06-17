@@ -1,0 +1,46 @@
+[package]
+name = "voice_translator"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "voice_translator_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0.102"
+reqwest = { version = "0.13.4", features = ["json", "multipart", "blocking", "form", "query"] }
+nnnoiseless = { version = "0.5.2", default-features = false }
+# 进程内 ASR + VAD：sherpa-onnx（SenseVoice 识别 + Silero VAD，静态链接，无需运行期 DLL/sidecar）
+# 注：VAD 也用 sherpa 自带，避免再引入第二份 onnxruntime（与 sherpa 静态库符号冲突）。
+sherpa-onnx = "1.13.2"
+# 本地时间命名会话译文文件（YYYY-MM-DD_HHmmss）；clock 特性提供 Local
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# WASAPI 仅 Windows（系统音频环回 + 麦克风，开箱即用）
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23.0"
+
+# 麦克风采集（跨平台）：macOS / Linux 用 cpal；Windows 仍走上面的 WASAPI。
+# 系统音频环回：macOS 用 ScreenCaptureKit，Linux 用 PulseAudio/PipeWire monitor 源（cpal）。
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+cpal = "0.15"
+
+# macOS 系统音频采集：ScreenCaptureKit（音频能力需 macos_13_0 feature）
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "7.0", features = ["macos_13_0"] }
+

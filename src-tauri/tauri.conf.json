@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoiceTranslator",
+  "version": "0.1.0",
+  "identifier": "com.administrator.voicetranslator",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "语音翻译 · Voice Translator",
+        "width": 920,
+        "height": 680,
+        "minWidth": 720,
+        "minHeight": 520,
+        "additionalBrowserArgs": "--disable-features=msWebView2EnableDraggableRegions --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
+      },
+      {
+        "label": "overlay",
+        "title": "字幕",
+        "url": "overlay.html",
+        "width": 760,
+        "height": 150,
+        "x": 280,
+        "y": 780,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebView2EnableDraggableRegions --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "sidecar/models/silero_vad.onnx"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

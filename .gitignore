@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust 构建产物（体积巨大，绝不入库）
+src-tauri/target/
+experiments/**/target/
+
+# whisper.cpp sidecar 二进制 + 大模型（下载产物，体积大，不入库；获取方式见 README）
+# 例外：Silero VAD 模型是 tauri 打包必需资源（2.2MB），需入库
+src-tauri/sidecar/*
+!src-tauri/sidecar/models/
+src-tauri/sidecar/models/*
+!src-tauri/sidecar/models/silero_vad.onnx
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
