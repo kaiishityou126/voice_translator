@@ -512,7 +512,7 @@ mod platform {
         if list.num_buffers() == 0 {
             return Vec::new();
         }
-        let Ok(buf) = list.get(0) else {
+        let Some(buf) = list.get(0) else {
             return Vec::new();
         };
         let bytes = buf.data();
