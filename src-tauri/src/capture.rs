@@ -253,9 +253,10 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use anyhow::{anyhow, bail, Result};
+    use core_media_rs::cm_sample_buffer::CMSampleBuffer;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use screencapturekit::prelude::{
-        CMSampleBuffer, CMSampleBufferExt, SCStreamOutputTrait, SCStreamOutputType,
+    use screencapturekit::stream::{
+        output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType,
     };
     use tauri::{AppHandle, Emitter, Manager};
 
@@ -402,29 +403,39 @@ mod platform {
             "loopback" => {
                 // 系统音频采集：ScreenCaptureKit（macOS 13.0+，需「屏幕录制」授权）。
                 // 仅取音频，video 配置给最小尺寸以降低开销。
-                use screencapturekit::prelude::*;
+                use screencapturekit::{
+                    shareable_content::SCShareableContent,
+                    stream::{
+                        configuration::SCStreamConfiguration,
+                        content_filter::SCContentFilter, SCStream,
+                    },
+                };
 
-                let content = SCShareableContent::get().map_err(|e| {
-                    anyhow!("无法获取可共享内容（可能未授权屏幕录制）: {:?}", e)
-                })?;
-                let display = content
+                let display = SCShareableContent::get()
+                    .map_err(|e| {
+                        anyhow!("无法获取可共享内容（可能未授权屏幕录制）: {:?}", e)
+                    })?
                     .displays()
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow!("未找到显示器"))?;
 
-                let filter = SCContentFilter::create()
-                    .with_display(&display)
-                    .with_excluding_windows(&[])
-                    .build();
+                let filter =
+                    SCContentFilter::new().with_display_excluding_windows(&display, &[]);
 
                 // captures_audio=true 开系统音频；单声道 48k 与下游处理对齐。
+                // 各 setter 链式返回 Result，逐个 map_err 成中文错误。
                 let config = SCStreamConfiguration::new()
-                    .with_width(2)
-                    .with_height(2)
-                    .with_captures_audio(true)
-                    .with_sample_rate(48000)
-                    .with_channel_count(1);
+                    .set_width(2)
+                    .map_err(|e| anyhow!("配置采集宽度失败: {:?}", e))?
+                    .set_height(2)
+                    .map_err(|e| anyhow!("配置采集高度失败: {:?}", e))?
+                    .set_captures_audio(true)
+                    .map_err(|e| anyhow!("开启系统音频采集失败: {:?}", e))?
+                    .set_sample_rate(48000)
+                    .map_err(|e| anyhow!("配置音频采样率失败: {:?}", e))?
+                    .set_channel_count(1)
+                    .map_err(|e| anyhow!("配置音频声道数失败: {:?}", e))?;
 
                 let (raw_tx, raw_rx) = channel::<Vec<f32>>();
 
@@ -493,12 +504,15 @@ mod platform {
     }
 
     /// 从音频 CMSampleBuffer 取出单声道 f32 PCM。
-    /// 按 with_channel_count(1) 请求，取第一个 buffer 即单声道连续 f32（小端字节）。
+    /// 按 set_channel_count(1) 请求，取第一个 buffer 即单声道连续 f32（小端字节）。
     fn extract_audio_samples(sample: &CMSampleBuffer) -> Vec<f32> {
-        let Some(list) = sample.audio_buffer_list() else {
+        let Ok(list) = sample.get_audio_buffer_list() else {
             return Vec::new();
         };
-        let Some(buf) = list.buffer(0) else {
+        if list.num_buffers() == 0 {
+            return Vec::new();
+        }
+        let Ok(buf) = list.get(0) else {
             return Vec::new();
         };
         let bytes = buf.data();
@@ -526,7 +540,7 @@ mod platform {
             }
             "loopback" => {
                 // 首次调用会让系统在「隐私与安全性 → 屏幕录制」登记本应用并触发授权。
-                use screencapturekit::prelude::SCShareableContent;
+                use screencapturekit::shareable_content::SCShareableContent;
                 if SCShareableContent::get().is_ok() {
                     Ok(())
                 } else {
