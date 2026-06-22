@@ -70,8 +70,9 @@ impl SileroCore {
             // 过滤短于 0.25s 的噪点，避免咖哒声起一段空段。
             min_speech_duration: 0.25,
             window_size: 512, // Silero v5 @16k 固定窗
-            // 单段硬上限，兜底防超长句拖延出字；正常都在停顿处先切。
-            max_speech_duration: 12.0,
+            // 单段硬上限：SenseVoice 是为短音频优化的非流式模型，段越长越易把连续快语退化成
+            // 同音乱码（实测 12s 长段是后半段崩坏温床）。压到 6s 强制在更短处切，从源头降低识别退化。
+            max_speech_duration: 6.0,
         };
         config.sample_rate = 16_000;
         config.num_threads = 1;
