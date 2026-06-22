@@ -30,6 +30,8 @@ nnnoiseless = { version = "0.5.2", default-features = false }
 sherpa-onnx = "1.13.2"
 # 本地时间命名会话译文文件（YYYY-MM-DD_HHmmss）；clock 特性提供 Local
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 离线语种识别（纯 Rust，无网络/系统依赖）：仅用于 LLM 译文「是否还是原文那语种」的兜底判断。
+whatlang = "0.16"
 
 # WASAPI 仅 Windows（系统音频环回 + 麦克风，开箱即用）
 [target.'cfg(windows)'.dependencies]

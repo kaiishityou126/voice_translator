@@ -50,7 +50,62 @@ pub fn translate(
 }
 
 // ---------------- OpenAI 兼容（OpenAI / Ollama 共用、流式 SSE） ----------------
+/// 兜底重译：仅 LLM 路径（openai 兼容 / ollama）经过这里，Google / none 不走。
+/// 先正常带上下文翻一次；若 whatlang 判定「译文与原文同一语种」（模型很可能没翻、原样吐回），
+/// 清空多轮上下文重译一次——历史里混入的未翻译译文会诱导模型继续不翻，清空可切断这种传染。
 fn chat_translate(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    target_name: &str,
+    text: &str,
+    context: &[(String, String)],
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<String> {
+    // 第一次先憋住不推前端（sink 吞掉流式增量），等整句翻完再判定语种：
+    // 这样若判定「没翻译/原样吐回」，这段未翻译内容既不显示也不会被上层写库，直接重译。
+    let out = {
+        let mut sink = |_: &str| {};
+        chat_once(
+            client, base_url, api_key, model, target_name, text, context, &mut sink,
+        )?
+    };
+    if same_language(text, &out) && !is_target_lang(text, target_name) {
+        // 清空多轮上下文重译，这次才把增量推给前端显示。
+        return chat_once(
+            client, base_url, api_key, model, target_name, text, &[], on_chunk,
+        );
+    }
+    // 正常译文：整句一次性推前端（已无逐字流式，原文在 ASR 阶段已即时显示）。
+    on_chunk(&out);
+    Ok(out)
+}
+
+/// 用 whatlang 粗判两段文本是否同一语种，仅用于「译文是否还是原文那语种」的兜底判断：
+/// 返回 true ≈ LLM 没翻译（把原文原样吐回）。文本过短时 whatlang 不可靠，直接返回 false（不重译）。
+fn same_language(src: &str, out: &str) -> bool {
+    if src.chars().count() < 4 || out.chars().count() < 4 {
+        return false;
+    }
+    match (whatlang::detect_lang(src), whatlang::detect_lang(out)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 源文本本身是否就是目标语（如目标中文、音频也是中文）：此时「译文与原文同语种」属正常，
+/// 用户本就要同语种，不该重译。target_name 为提示词用的英文名，映射到 whatlang 语种。
+fn is_target_lang(src: &str, target_name: &str) -> bool {
+    let target = match target_name {
+        "English" => whatlang::Lang::Eng,
+        "Japanese" => whatlang::Lang::Jpn,
+        _ => whatlang::Lang::Cmn, // Simplified Chinese
+    };
+    whatlang::detect_lang(src) == Some(target)
+}
+
+fn chat_once(
     client: &reqwest::blocking::Client,
     base_url: &str,
     api_key: &str,
@@ -67,12 +122,21 @@ fn chat_translate(
          The input comes from live speech recognition and may contain recognition errors, missing or \
          wrong characters, run-on sentences, or no punctuation — infer the intended meaning from context \
          and produce one clean, natural, grammatical sentence in {target}. \
-         The source text may be in any language; always translate the whole text into {target}, \
-         regardless of the source language. Many Japanese kanji look identical to Chinese characters \
-         but are NOT Chinese — translate them into natural {target}. Only return the text unchanged \
-         if it is genuinely and entirely already in {target}. \
+         The target language is fixed to {target} by the user. You MUST always output {target}, \
+         no matter what language the source is in. Never copy the source text as-is and never \
+         output any language other than {target}. Do NOT decide for yourself whether the text \
+         is \"already translated\"; even if the whole input looks like it could be {target}, still \
+         rewrite it as a clean, natural {target} sentence. Many Japanese kanji look identical to \
+         Chinese characters but are NOT Chinese — always render them as natural {target}. Japanese \
+         proper nouns, organization names, award titles and work titles MUST also be translated or \
+         transliterated into {target}; never leave them in Japanese kana or Japanese wording. \
          Keep numbers, codes and Latin-letter proper nouns as they are, but render currency and units \
          in the natural {target} form (for example Japanese 円 means Japanese yen → 日元, never 元). \
+         Preserve every number, digit, decimal, percentage and year EXACTLY as in the source — never \
+         change their magnitude, scale or unit (for example 0.75% stays 0.75%, never 75%; a rate \
+         reaching the 1% level must not become any other figure). \
+         The content is third-person broadcast narration; unless the source explicitly uses first or \
+         second person, do NOT introduce \"I\", \"we\" or \"you\" — keep it as neutral third-person narration. \
          Do not add, omit or embellish information; stay faithful to what was said. \
          Output ONLY the translation itself — no quotes, no notes, no explanations, no source text, \
          no pinyin or romanization. Keep it fluent, faithful and concise, fit for a single subtitle line.",
