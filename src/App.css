@@ -433,11 +433,11 @@ body {
 }
 
 .sub-card .trans {
-  color: var(--text-dim);
+  color: var(--text);
   font-size: 14.5px;
   line-height: 1.55;
   margin-top: 3px;
-  font-weight: 400;
+  font-weight: 500;
 }
 
 .sub-card .trans.pending {
