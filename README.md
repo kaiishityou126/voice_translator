@@ -91,6 +91,34 @@ npm run tauri build   # 产物在 src-tauri/target/release/bundle/（NSIS .exe +
 - 模型不打包，安装包仅含 whisper 二进制 + 前端（~15MB）；用户首次运行按需下载模型。
 - **代码签名**：需自备代码签名证书。Windows 在 `tauri.conf.json` 的 `bundle.windows.certificateThumbprint`（+ `signCommand` 或 `timestampUrl`）配置；无证书则产物为**未签名**安装包（用户安装时 SmartScreen 会警告）。
 
+## 安装时的安全提示（未签名说明）
+
+本项目是**免费开源软件，未购买代码签名证书**，因此各平台首次安装会弹安全提示。这与软件本身是否安全无关——操作系统对任何未签名应用都会这样提示。绕过方法如下：
+
+**Windows（SmartScreen）**
+
+双击安装包若出现「Windows 已保护你的电脑 / Windows protected your PC」：
+
+1. 点蓝字 **更多信息 / More info**
+2. 再点 **仍要运行 / Run anyway**
+
+**macOS（Gatekeeper）**
+
+DMG 未签名 / 未公证，安装后首次打开可能提示「无法打开，因为无法验证开发者」。任选其一：
+
+- **右键点 App → 打开 → 在弹窗里再点「打开」**（推荐，最简单）；或
+- 终端去掉隔离属性后再打开：
+
+  ```bash
+  xattr -dr com.apple.quarantine "/Applications/语音翻译.app"
+  ```
+
+**Linux**
+
+`.AppImage` 下载后需加可执行权限：`chmod +x 语音翻译*.AppImage`，再双击或命令行运行；`.deb` 用 `sudo dpkg -i 语音翻译*.deb` 安装。
+
+> 想彻底消除 Windows 警告，开源项目可申请 [SignPath Foundation](https://signpath.org/) 的**免费**代码签名；macOS 公证需 Apple 开发者账号（$99/年）。详见路线图。
+
 ## 路线图
 
 - **P1（已完成）** Windows 端到端：系统音频 → 识别 → 翻译 → 字幕
