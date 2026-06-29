@@ -20,6 +20,14 @@ fn default_ollama_model() -> String {
     "qwen2.5".to_string()
 }
 
+fn default_asr_engine() -> String {
+    "senseVoice".to_string()
+}
+
+fn default_summary_max_context() -> usize {
+    48_000
+}
+
 /// 前端 start_translation 传入的运行时配置。字段名与前端 camelCase 对齐。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +45,10 @@ pub struct RuntimeConfig {
     pub source_lang: String,
     /// 目标语言："zh" / "en" / "ja"
     pub target_lang: String,
+
+    /// ASR 引擎："senseVoice"(默认、快、CTC) / "qwen3Asr"(精准、LLM 解码、+延迟、需下载 ~940MB)
+    #[serde(default = "default_asr_engine")]
+    pub asr_engine: String,
 
     /// 翻译引擎："openai" / "ollama"(本地) / "google"(免费非官方) / "none"(纯字幕)
     #[serde(default = "default_translation_engine")]
@@ -57,6 +69,10 @@ pub struct RuntimeConfig {
     pub energy_threshold: Option<f32>,
     #[serde(default)]
     pub silence_ms: Option<u64>,
+
+    /// 重点提炼单次最大上下文（≈token，CJK 约等于字数）：记录超此预算时自动分块 map-reduce 提炼
+    #[serde(default = "default_summary_max_context")]
+    pub summary_max_context: usize,
 }
 
 impl RuntimeConfig {
@@ -65,6 +81,12 @@ impl RuntimeConfig {
         match self.target_lang.as_str() {
             "en" => "English",
             "ja" => "Japanese",
+            "ko" => "Korean",
+            "yue" => "Cantonese",
+            "fr" => "French",
+            "es" => "Spanish",
+            "de" => "German",
+            "ru" => "Russian",
             _ => "Simplified Chinese",
         }
     }

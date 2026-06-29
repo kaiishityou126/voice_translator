@@ -27,7 +27,7 @@ reqwest = { version = "0.13.4", features = ["json", "multipart", "blocking", "fo
 nnnoiseless = { version = "0.5.2", default-features = false }
 # 进程内 ASR + VAD：sherpa-onnx（SenseVoice 识别 + Silero VAD，静态链接，无需运行期 DLL/sidecar）
 # 注：VAD 也用 sherpa 自带，避免再引入第二份 onnxruntime（与 sherpa 静态库符号冲突）。
-sherpa-onnx = "1.13.2"
+sherpa-onnx = "1.13.3"
 # 本地时间命名会话译文文件（YYYY-MM-DD_HHmmss）；clock 特性提供 Local
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 离线语种识别（纯 Rust，无网络/系统依赖）：仅用于 LLM 译文「是否还是原文那语种」的兜底判断。

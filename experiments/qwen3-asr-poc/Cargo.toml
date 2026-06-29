@@ -1,0 +1,18 @@
+[package]
+name = "qwen3-asr-poc"
+version = "0.1.0"
+edition = "2021"
+
+# 独立 POC：仅离线验证 Qwen3-ASR-0.6B-int8 在 CPU 上的准确率与逐段延迟。
+# 不依赖 src-tauri，不改主工程。用 sherpa-onnx 1.13.3（含 OfflineQwen3ASRModelConfig）。
+
+[dependencies]
+sherpa-onnx = "1.13.3"
+
+[[bin]]
+name = "qwen3-asr-poc"
+path = "src/main.rs"
+
+# release 才有意义（int8 推理性能依赖优化）
+[profile.release]
+opt-level = 3

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use crate::denoise::{Decimator3, Denoiser};
-use crate::segmenter::Segmenter;
+use crate::segmenter::{SegLimits, Segmenter};
 
 const TARGET_RATE: usize = 16_000; // 喂给 SenseVoice
 const CAPTURE_RATE: usize = 48_000; // 采集 + 降噪工作采样率
@@ -35,23 +35,24 @@ impl Processor {
         silero_model: Option<PathBuf>,
         energy_threshold: f32,
         silence_ms: u64,
+        limits: SegLimits,
     ) -> Self {
         let mut vad_kind = "energy";
         let segmenter = match (use_silero, silero_model) {
             (true, Some(model)) => {
                 // Silero 阈值 0.5（标准值）：原生分段下这个阈值对停顿点的判定最稳。
-                match Segmenter::silero(&model, 0.5) {
+                match Segmenter::silero(&model, 0.5, limits) {
                     Ok(s) => {
                         vad_kind = "silero";
                         s
                     }
                     Err(e) => {
                         eprintln!("[vad] Silero 初始化失败，回退能量门限: {}", e);
-                        Segmenter::energy(energy_threshold, silence_ms)
+                        Segmenter::energy(energy_threshold, silence_ms, limits)
                     }
                 }
             }
-            _ => Segmenter::energy(energy_threshold, silence_ms),
+            _ => Segmenter::energy(energy_threshold, silence_ms, limits),
         };
         Self {
             denoise,
@@ -112,7 +113,7 @@ impl Processor {
 // ======================== Windows：WASAPI ========================
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{Processor, CAPTURE_RATE};
+    use super::{Processor, SegLimits, CAPTURE_RATE};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::SyncSender;
@@ -140,6 +141,7 @@ mod platform {
         use_silero: bool,
         energy_threshold: f32,
         silence_ms: u64,
+        limits: SegLimits,
         stop: Arc<AtomicBool>,
         seg_tx: SyncSender<Vec<f32>>,
         app: AppHandle,
@@ -180,7 +182,7 @@ mod platform {
         } else {
             None
         };
-        let mut proc = Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms);
+        let mut proc = Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
         // 上报实际生效的 VAD（release/安装态看不到日志，靠它在 UI 里观测）
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
         let mut mono48 = Vec::<f32>::with_capacity(CAPTURE_RATE);
@@ -246,7 +248,7 @@ mod platform {
 // ======================== macOS：麦克风(cpal) + 系统音频(ScreenCaptureKit) ========================
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{Processor, CAPTURE_RATE};
+    use super::{Processor, SegLimits, CAPTURE_RATE};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError, SyncSender};
     use std::sync::Arc;
@@ -309,6 +311,7 @@ mod platform {
         use_silero: bool,
         energy_threshold: f32,
         silence_ms: u64,
+        limits: SegLimits,
         stop: Arc<AtomicBool>,
         seg_tx: SyncSender<Vec<f32>>,
         app: AppHandle,
@@ -325,7 +328,7 @@ mod platform {
             None
         };
         let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms);
+            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         match source {
@@ -544,7 +547,8 @@ mod platform {
                 if SCShareableContent::get().is_ok() {
                     Ok(())
                 } else {
-                    bail!("系统音频采集不可用：请在「系统设置 → 隐私与安全性 → 屏幕录制」中授权本应用，然后重启应用")
+                    // 前缀 SCREEN_PERMISSION 为稳定错误码，前端据此识别并展示授权引导（勿改码名）。
+                    bail!("SCREEN_PERMISSION 系统音频采集不可用：请在「系统设置 → 隐私与安全性 → 屏幕录制」中授权本应用，然后重启应用")
                 }
             }
             _ => bail!("不支持的来源: {}", source),
@@ -555,7 +559,7 @@ mod platform {
 // ======================== Linux：麦克风(cpal) + 系统音频(PipeWire/PulseAudio monitor) ========================
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Processor, CAPTURE_RATE};
+    use super::{Processor, SegLimits, CAPTURE_RATE};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError, SyncSender};
     use std::sync::Arc;
@@ -614,6 +618,7 @@ mod platform {
         use_silero: bool,
         energy_threshold: f32,
         silence_ms: u64,
+        limits: SegLimits,
         stop: Arc<AtomicBool>,
         seg_tx: SyncSender<Vec<f32>>,
         app: AppHandle,
@@ -630,7 +635,7 @@ mod platform {
             None
         };
         let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms);
+            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         let host = cpal::default_host();
@@ -829,6 +834,7 @@ mod platform {
         _use_silero: bool,
         _energy_threshold: f32,
         _silence_ms: u64,
+        _limits: crate::segmenter::SegLimits,
         _stop: Arc<AtomicBool>,
         _seg_tx: SyncSender<Vec<f32>>,
         _app: tauri::AppHandle,

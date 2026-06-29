@@ -4,7 +4,7 @@
 
 技术栈:**Tauri 2**(Rust 后端)+ **React 19 + TypeScript**(前端,Vite 构建)。当前 Windows 端到端可用,macOS 仅有占位代码。
 
-详细安装与使用见 [README.md](README.md);已知问题与待办见 [开发交接-问题与待办.md](开发交接-问题与待办.md)(改动前务必先读)。
+详细安装与使用见 [README.md](README.md)。
 
 ## 构建与开发命令
 
@@ -18,7 +18,7 @@ npm run build                # 仅前端 TypeScript 类型检查 + 打包
 cd src-tauri; cargo check    # 仅 Rust 编译检查
 ```
 
-**识别引擎**:sherpa-onnx 静态链接进程内运行(无 sidecar、无 HTTP)。SenseVoice int8 模型(`sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`,约 239MB,支持 zh/en/ja/ko/yue)不打包,首次使用按需下载到 `%APPDATA%\com.administrator.voicetranslator\models\`。另需 `src-tauri/sidecar/models/silero_vad.onnx` 用于 VAD 分段。
+**识别引擎**:sherpa-onnx 静态链接进程内运行(无 sidecar、无 HTTP)。SenseVoice int8 模型(`sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09`,约 237MB,支持 zh/en/ja/ko/yue)不打包,首次使用按需下载到 `%APPDATA%\com.administrator.voicetranslator\models\`。另需 `src-tauri/sidecar/models/silero_vad.onnx` 用于 VAD 分段。
 
 ## 架构:三线程流水线
 
@@ -43,7 +43,7 @@ ASR 线程 (sherpa-onnx SenseVoice 进程内) → 识别 → 发出 {id, origina
 | [asr.rs](src-tauri/src/asr.rs) | sherpa-onnx SenseVoice 识别器加载/调用(进程内、num_threads=4 CPU)、模型按需下载、幻觉与套话熜断 |
 | [capture.rs](src-tauri/src/capture.rs) | Windows WASAPI 环回/麦克风采集;macOS 为占位(`bail!`) |
 | [denoise.rs](src-tauri/src/denoise.rs) | RNNoise 降噪(480 样本/帧 @48k)+ Decimator3 重采样(48k→16k) |
-| [segmenter.rs](src-tauri/src/segmenter.rs) | `Vad` trait(可插拔):`EnergyVad`(零依赖)/ `SileroVad`(ML);带 preroll、最长 8s、最短 300ms |
+| [segmenter.rs](src-tauri/src/segmenter.rs) | 分段：默认原生 `SileroCore`（sherpa Silero VAD）/ 可关闭回退到 `EnergyVad`（`Vad` trait、零依赖）；带 preroll、最短 300ms；最长按引擎自适应（`SegLimits::for_engine`：SenseVoice 7s / Qwen3 10s） |
 | [translate.rs](src-tauri/src/translate.rs) | 多引擎分发:OpenAI 兼容(openai/ollama)、Google 免费(非官方)、none 纯字幕;含会话重点提炼 |
 | [config.rs](src-tauri/src/config.rs) | `RuntimeConfig` 结构体(serde camelCase) |
 | [main.rs](src-tauri/src/main.rs) | 入口,调用 `lib::run()` |
@@ -77,8 +77,6 @@ ASR 线程 (sherpa-onnx SenseVoice 进程内) → 识别 → 发出 {id, origina
 
 ## 已知陷阱
 
-- **悬浮窗当前不显示**(P0):仅在 release 构建调试;可能是透明合成、overlay.html 未打包或窗口创建竞态。详见交接文档。
-- **主窗口译文可能不显示**(疑似回归):排查时把引擎切到 `none` 隔离 ASR 与翻译。
 - Google 引擎为非官方接口,可能被限流。
 
 > 提交规范:Conventional Commits(`type(scope): subject`),推 `main` 分支需二次确认,详见用户全局 CLAUDE.md。

@@ -16,6 +16,12 @@ dist-ssr
 src-tauri/target/
 experiments/**/target/
 
+# POC 下载的大模型与压缩包（约 940MB，不入库，下载方式见 POC README）
+experiments/qwen3-asr-poc/sherpa-onnx-qwen3-asr-*/
+experiments/**/*.tar.bz2
+# POC 录制/切分的测试音频，不入库
+experiments/**/*.wav
+
 # whisper.cpp sidecar 二进制 + 大模型（下载产物，体积大，不入库；获取方式见 README）
 # 例外：Silero VAD 模型是 tauri 打包必需资源（2.2MB），需入库
 src-tauri/sidecar/*

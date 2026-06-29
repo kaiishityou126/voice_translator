@@ -35,8 +35,9 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri`，以及独立 POC 工程 `experiments`
+      //    （experiments 里的 cargo 构建会大量改动 target/，会触发 Vite 监视器 EBUSY 崩溃）
+      ignored: ["**/src-tauri/**", "**/experiments/**"],
     },
   },
 }));

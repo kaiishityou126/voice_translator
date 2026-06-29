@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,6 @@ struct SubtitleEvent {
     id: u64,
     original: String,
     translated: String,
-    source_lang: String,
     ts: u128,
     pending: bool,
 }
@@ -55,6 +54,19 @@ fn emit_status(app: &AppHandle, gen: u64, state: &str, detail: Option<String>) {
     );
 }
 
+/// 停止后由命令层直接补发一条权威 idle：绕过代号守卫。
+/// stop() 会先把代号 +1，导致翻译线程退出时发的终态 idle 被 emit_status 守卫吞掉，
+/// 那条 idle 又是同步所有窗口（主窗+悬浮窗）的唯一信号，故必须在此显式无条件补发。
+pub fn emit_idle(app: &AppHandle) {
+    let _ = app.emit(
+        "status",
+        StatusEvent {
+            state: "idle".to_string(),
+            detail: None,
+        },
+    );
+}
+
 fn emit_subtitle(app: &AppHandle, gen: u64, ev: SubtitleEvent) {
     if PIPELINE_GEN.load(Ordering::SeqCst) != gen {
         return; // 非当前代，丢弃
@@ -71,6 +83,8 @@ fn now_ms() -> u128 {
 
 pub struct PipelineHandle {
     stop: Arc<AtomicBool>,
+    // 运行中可热切的目标语言（翻译 worker 每段读一次）。与采集/识别无关，故无需重启流水线。
+    target_lang: Arc<RwLock<String>>,
 }
 
 impl PipelineHandle {
@@ -80,10 +94,17 @@ impl PipelineHandle {
         // 被 emit_status 的守卫丢弃，避免前端 running 被翻回 true（停止需点两次）。
         PIPELINE_GEN.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// 运行中热切翻译目标语言：仅影响此后开始翻译的段落，在途/已译段保持原语言。
+    pub fn set_target_lang(&self, lang: String) {
+        *self.target_lang.write().unwrap() = lang;
+    }
 }
 
-/// 启动流水线。`recognizer` 是已加载好的进程内 SenseVoice 识别器（只读共享）。
-pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfig) -> PipelineHandle {
+/// 启动流水线。`recognizer` 是已加载好的进程内识别器（SenseVoice / Qwen3，只读共享）。
+pub fn start(app: AppHandle, recognizer: Arc<dyn asr::Asr>, cfg: RuntimeConfig) -> PipelineHandle {
+    // auto 模式下解锁语种检测，让本轮重新判别（避免沿用上一轮锁定的语种）
+    recognizer.reset_session();
     // 本次流水线代号：自增后所有线程只发本代事件，旧代迟到事件被守卫丢弃
     let my_gen = PIPELINE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
@@ -101,6 +122,8 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
     // 句末长停阈值：~1s 才判定一句说完。换气类短停（<1s）被容忍，不切，
     // 避免一句话被拦腰切两段；段内超长时由 segmenter 的短停阈值+软上限兜底收尾。
     let silence_ms = cfg.silence_ms.unwrap_or(1000);
+    // 切段时长上限按 ASR 引擎区分：SenseVoice 短段实时，Qwen3 长段给足上下文。
+    let seg_limits = crate::segmenter::SegLimits::for_engine(&cfg.asr_engine);
     thread::spawn(move || {
         if let Err(e) = capture::capture_thread(
             &source,
@@ -108,6 +131,7 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
             use_silero,
             threshold,
             silence_ms,
+            seg_limits,
             stop_cap,
             seg_tx,
             app_cap.clone(),
@@ -138,7 +162,6 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                         id,
                         original: text,
                         translated: String::new(),
-                        source_lang: String::new(),
                         ts: now_ms(),
                         pending: false,
                     },
@@ -153,7 +176,6 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                     id,
                     original: text.clone(),
                     translated: String::new(),
-                    source_lang: String::new(),
                     ts: now_ms(),
                     pending: true,
                 },
@@ -169,7 +191,6 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                             id: tid,
                             original: otext,
                             translated: "[翻译积压，已跳过]".to_string(),
-                            source_lang: String::new(),
                             ts: now_ms(),
                             pending: false,
                         },
@@ -202,6 +223,11 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                         eprintln!("[asr] 丢弃固定幻觉短语：{}", text);
                         continue;
                     }
+                    // Qwen3-ASR 对话模板泄漏（噪声/音乐段吐出 <asr_text>/system 等骨架 token）直接丢弃
+                    if asr::is_template_leak(&text) {
+                        eprintln!("[asr] 丢弃模板泄漏段：{}", text);
+                        continue;
+                    }
                     flush_one(text);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -215,6 +241,8 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
     const NUM_TRANSLATORS: usize = 2; // 并发 worker 数
     const CONTEXT_KEEP: usize = 4; // 历史保留条数
     const CONTEXT_USE: usize = 2; // 喂给 LLM 的前文条数
+    // 目标语言独立成可变共享槽（其余配置仍只读）；set_target_lang 写它，worker 每段读它。
+    let live_target = Arc::new(RwLock::new(cfg.target_lang.clone()));
     let cfg = Arc::new(cfg); // 多 worker 共享只读配置
     let txt_rx = Arc::new(Mutex::new(txt_rx)); // 单生产者多消费者：worker 抢锁 try_recv
     // 已完成翻译的最近历史 (id, 原文, 译文)，作为 LLM 上下文；并发下按完成序近似，实时场景足够
@@ -222,7 +250,7 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
     // 本会话译文落盘写入器（多 worker 共享，成功译文逐段追加）；纯字幕模式无翻译故不会产生文件
     let session_writer = crate::transcript::transcripts_dir(&app).map(|d| {
         let stem = crate::transcript::session_stem_now();
-        Arc::new(crate::transcript::SessionWriter::new(d.join(format!("{stem}.txt"))))
+        Arc::new(crate::transcript::SessionWriter::new(d.join(format!("{stem}.jsonl"))))
     });
 
     for _ in 0..NUM_TRANSLATORS {
@@ -230,12 +258,13 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
         let app_tr = app.clone();
         let gen_tr = my_gen;
         let cfg = cfg.clone();
+        let live_target = live_target.clone();
         let rx = txt_rx.clone();
         let hist = history.clone();
         let writer = session_writer.clone();
         thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(15)) // 实时场景：超时即放弃该段，不阻塞队列
+                .timeout(Duration::from_secs(30)) // 兜底救偶发长句：本地 CPU 慢模型长句可能 20~30s，给足时间再放弃
                 .build()
                 .expect("http client");
             loop {
@@ -243,7 +272,11 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                     break;
                 }
                 // 抢锁拿一个任务后立即释放锁（try_recv 不阻塞，保证多 worker 真并发）
-                let item = { rx.lock().unwrap().try_recv() };
+                // 抢锁阻塞等一个任务(最多 250ms 便于查 stop)；拿到后立即出作用域释放锁，再处理。
+                // 锁只在「等待/接收」时持有，HTTP 翻译在锁外执行 → 多 worker 仍真并发；
+                // 同一时刻只有一个 worker 在 recv 上等待，另一个阻塞在 lock() 上(非自旋、不耗 CPU)，
+                // 一旦来消息持锁者立即取走并放锁，下一个 worker 接力等待。
+                let item = { rx.lock().unwrap().recv_timeout(Duration::from_millis(250)) };
                 match item {
                     Ok((id, text)) => {
                         emit_status(&app_tr, gen_tr, "translating", None);
@@ -255,8 +288,9 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                                 .map(|(_, o, t)| (o.clone(), t.clone()))
                                 .collect()
                         };
-                        // 流式回调：每帧把「截至目前的全量累计译文」按同一 id 回填（pending=true），
-                        // 前端整条替换即可逐字增长。节流 ~100ms 一帧，避免事件风暴。
+                        // 译文回调：把「截至目前的全量累计译文」按同一 id 回填（pending=true），前端整条替换。
+                        // 注：当前 LLM 路径为整句翻完一次性回填（translate.rs 先憋住判定语种再决定是否重译），
+                        // Google 本就无流式 → 实际多为整句到达；此处保留节流 ~100ms 仅防极端事件风暴。
                         let mut last_emit: Option<std::time::Instant> = None;
                         let on_chunk = |acc: &str| {
                             let due = last_emit
@@ -270,28 +304,42 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                                         id,
                                         original: text.clone(),
                                         translated: acc.to_string(),
-                                        source_lang: String::new(),
                                         ts: now_ms(),
                                         pending: true,
                                     },
                                 );
                             }
                         };
-                        let translated = match translate::translate(&client, &cfg, &text, &ctx, on_chunk) {
-                            Ok(t) => t,
-                            Err(e) => format!("[翻译失败] {}", e),
+                        // 热切目标语言：读共享槽，与启动值不同时克隆配置覆盖该字段后再翻译。
+                        let want_lang = { live_target.read().unwrap().clone() };
+                        let eff = if want_lang == cfg.target_lang {
+                            None
+                        } else {
+                            let mut c = (*cfg).clone();
+                            c.target_lang = want_lang;
+                            Some(c)
                         };
-                        // 只把成功译文写进历史，避免把 "[翻译失败]" 当上下文喂回模型
-                        if !translated.starts_with("[翻译失败]") {
+                        let use_cfg: &RuntimeConfig = eff.as_ref().unwrap_or(&cfg);
+                        let translated = match translate::translate(&client, use_cfg, &text, &ctx, on_chunk) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("[translate] 失败 engine={} err={:#}", cfg.translation_engine, e);
+                                format!("[翻译失败] {}", e)
+                            }
+                        };
+                        let failed = translated.starts_with("[翻译失败]");
+                        // 成功译文才进上下文历史，避免把失败标记当上下文喂回模型
+                        if !failed {
                             let mut h = hist.lock().unwrap();
                             h.push_back((id, text.clone(), translated.clone()));
                             while h.len() > CONTEXT_KEEP {
                                 h.pop_front();
                             }
-                            // 同步落盘本段双语（供事后提炼重点）；失败段不写，不污染摘要输入
-                            if let Some(w) = &writer {
-                                w.append(&text, &translated);
-                            }
+                        }
+                        // 落盘：成功写译文；失败写空译文（保留已识别原文，提炼时跳过空译文）。
+                        // 不把冗长的 429/报错全文写进存档，保持文件干净、不污染摘要输入。
+                        if let Some(w) = &writer {
+                            w.append(id, now_ms(), &text, if failed { "" } else { &translated });
                         }
                         // 终态帧：无条件发 pending=false 收尾（即使失败，也把最终态/失败标记定下来）
                         emit_subtitle(
@@ -301,21 +349,18 @@ pub fn start(app: AppHandle, recognizer: Arc<asr::SenseVoice>, cfg: RuntimeConfi
                                 id,
                                 original: text,
                                 translated,
-                                source_lang: String::new(),
                                 ts: now_ms(),
                                 pending: false,
                             },
                         );
                     }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             emit_status(&app_tr, gen_tr, "idle", None);
         });
     }
 
-    PipelineHandle { stop }
+    PipelineHandle { stop, target_lang: live_target }
 }

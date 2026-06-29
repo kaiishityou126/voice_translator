@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Pencil, Wand2, Check, X, AlertCircle } from "lucide-react";
+import { Pencil, Wand2, Check, X, AlertCircle, FolderOpen } from "lucide-react";
 
 interface Props {
   text: string;
@@ -9,6 +9,8 @@ interface Props {
   canResummarize: boolean;
   onResummarize: () => void;
   onSave: (content: string) => void;
+  // 打开存档文件夹
+  onOpenDir: () => void;
 }
 
 /// 重点提炼面板：流式显示本次会话译文的结构化摘要（Markdown 文本，按行简易渲染）。
@@ -21,14 +23,19 @@ export function SummaryPanel({
   canResummarize,
   onResummarize,
   onSave,
+  onOpenDir,
 }: Props) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
-  // 流式更新时滚动到底部（非编辑态）
+  // 流式更新时把内容容器自身滚到底（非编辑态）。
+  // 不用 scrollIntoView：它会逐个滚动可滚动祖先，首次渲染会把整个面板/头部一起带跑。
   useEffect(() => {
-    if (!editing) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!editing) {
+      const el = bodyRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
   }, [text, editing]);
 
   // 重新开始提炼时退出编辑态，避免草稿覆盖新结果
@@ -55,13 +62,14 @@ export function SummaryPanel({
         <div className="summary-actions">
           {editing ? (
             <>
-              <button className="iconbtn" onClick={save} title="保存">
+              <button className="iconbtn" onClick={save} data-tip="保存" data-tip-pos="end">
                 <Check size={17} strokeWidth={1.8} />
               </button>
               <button
                 className="iconbtn"
                 onClick={() => setEditing(false)}
-                title="取消"
+                data-tip="取消"
+                data-tip-pos="end"
               >
                 <X size={17} strokeWidth={1.8} />
               </button>
@@ -72,7 +80,8 @@ export function SummaryPanel({
                 className="iconbtn"
                 onClick={startEdit}
                 disabled={pending || error || !text}
-                title="手动编辑重点内容"
+                data-tip="手动编辑重点内容"
+                data-tip-pos="end"
               >
                 <Pencil size={16} strokeWidth={1.8} />
               </button>
@@ -80,13 +89,17 @@ export function SummaryPanel({
                 className="iconbtn"
                 onClick={onResummarize}
                 disabled={pending || !canResummarize}
-                title={
+                data-tip={
                   canResummarize
                     ? "再次调用 LLM 重新提炼"
                     : "重新提炼需 LLM 引擎（OpenAI / Ollama）"
                 }
+                data-tip-pos="end"
               >
                 <Wand2 size={16} strokeWidth={1.8} />
+              </button>
+              <button className="iconbtn" onClick={onOpenDir} data-tip="打开存档文件夹" data-tip-pos="end">
+                <FolderOpen size={16} strokeWidth={1.8} />
               </button>
             </>
           )}
@@ -100,14 +113,14 @@ export function SummaryPanel({
           autoFocus
         />
       ) : (
-        <div className="summary-body">
+        <div className="summary-body" ref={bodyRef}>
           {error ? (
             <div className="summary-error">
               <AlertCircle size={16} strokeWidth={2} />
               <span>{text}</span>
             </div>
-          ) : text ? (
-            text.split("\n").map((line, i) => {
+          ) : text.trim() ? (
+            text.trim().split("\n").map((line, i) => {
               if (line.startsWith("## ")) {
                 return <h4 key={i}>{line.slice(3)}</h4>;
               }
@@ -124,7 +137,6 @@ export function SummaryPanel({
           ) : (
             <div className="summary-loading">正在提炼重点…</div>
           )}
-          <div ref={bottomRef} />
         </div>
       )}
     </div>

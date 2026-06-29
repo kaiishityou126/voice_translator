@@ -17,8 +17,8 @@ use pipeline::PipelineHandle;
 #[derive(Default)]
 struct AppState {
     pipeline: Mutex<Option<PipelineHandle>>,
-    /// 进程内 SenseVoice 识别器；源语言变更时重建。
-    recognizer: Mutex<Option<Arc<asr::SenseVoice>>>,
+    /// 进程内识别器（SenseVoice / Qwen3）；引擎或源语言变更时重建。
+    recognizer: Mutex<Option<Arc<dyn asr::Asr>>>,
 }
 
 /// emit("summary", ...) 负载：与字幕流式同思路。pending=true 增量帧（全量累计），false 终态。
@@ -33,7 +33,7 @@ struct SummaryEvent {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SummaryFile {
-    /// 是否存在非空的 .summary.md
+    /// 是否存在非空的 .summary.<lang>.md
     exists: bool,
     /// 摘要内容（不存在则空串）
     text: String,
@@ -72,8 +72,9 @@ fn start_translation(
     debug_log(
         &app,
         &format!(
-            "start_translation: source={} engine={} srcLang={} tgtLang={} denoise={} silero={}",
+            "start_translation: source={} asr={} engine={} srcLang={} tgtLang={} denoise={} silero={}",
             config.source,
+            config.asr_engine,
             config.translation_engine,
             config.source_lang,
             config.target_lang,
@@ -85,21 +86,23 @@ fn start_translation(
     capture::probe(&config.source).map_err(|e| format!("音频设备不可用: {}", e))?;
 
     // 1.5 模型按需下载：缺失则让前端先触发下载
-    if !asr::model_present(&app) {
+    if !asr::model_present(&app, &config.asr_engine) {
         return Err("MODEL_MISSING".to_string());
     }
 
-    // 2. 加载/复用进程内 SenseVoice 识别器（源语言变更时重建；首次加载约 1~2s）
+    // 2. 加载/复用进程内识别器（引擎或源语言变更时重建）
     let recognizer = {
         let mut guard = state.recognizer.lock().unwrap();
+        let desired = asr::fingerprint_for(&config.asr_engine, &config.source_lang, &config.target_lang);
         let need_reload = match guard.as_ref() {
-            Some(sv) => sv.language != config.source_lang,
+            Some(a) => a.fingerprint() != desired,
             None => true,
         };
         if need_reload {
             *guard = None;
-            let sv = asr::SenseVoice::load(&app, &config.source_lang).map_err(|e| e.to_string())?;
-            *guard = Some(Arc::new(sv));
+            let a = asr::load(&app, &config.asr_engine, &config.source_lang, &config.target_lang)
+                .map_err(|e| e.to_string())?;
+            *guard = Some(a);
         }
         guard.as_ref().unwrap().clone()
     };
@@ -116,23 +119,34 @@ fn start_translation(
 }
 
 #[tauri::command]
-fn stop_translation(state: State<AppState>) -> Result<(), String> {
+fn stop_translation(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     if let Some(h) = state.pipeline.lock().unwrap().take() {
         h.stop();
     }
+    // 无论谁触发停止（主窗 / 悬浮窗），都向所有窗口补发权威 idle，保证两窗联动。
+    pipeline::emit_idle(&app);
     Ok(())
 }
 
-/// SenseVoice 模型是否已下载到数据目录。
+/// 运行中热切翻译目标语言：不重启流水线、不打断采集/识别。
+/// 仅翻译线程感知；在途/已译段保持原语言，此后新段用新语言。空闲(无流水线)时静默忽略。
 #[tauri::command]
-fn model_exists(app: AppHandle) -> bool {
-    asr::model_present(&app)
+fn set_target_lang(state: State<AppState>, target_lang: String) {
+    if let Some(h) = state.pipeline.lock().unwrap().as_ref() {
+        h.set_target_lang(target_lang);
+    }
 }
 
-/// 按需下载 SenseVoice 模型（进度走 "model-progress" 事件）。
+/// 指定 ASR 引擎的模型是否已下载到数据目录。
 #[tauri::command]
-fn download_model(app: AppHandle) -> Result<(), String> {
-    asr::download_model(&app).map_err(|e| e.to_string())
+fn model_exists(app: AppHandle, engine: String) -> bool {
+    asr::model_present(&app, &engine)
+}
+
+/// 按需下载指定 ASR 引擎的模型（进度走 "model-progress" 事件）。
+#[tauri::command]
+fn download_model(app: AppHandle, engine: String) -> Result<(), String> {
+    asr::download(&app, &engine).map_err(|e| e.to_string())
 }
 
 /// 开/关悬浮字幕窗（conf 定义的独立窗口，加载 overlay.html）。
@@ -185,7 +199,7 @@ fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
 }
 
 /// 提炼本次会话译文的重点（仅 LLM 引擎）。读最新会话译文文件 → 流式提炼 →
-/// emit("summary") 逐步回填，完成后写 <stem>.summary.md。立即返回，结果走事件不阻塞 UI。
+/// emit("summary") 逐步回填，完成后写 <stem>.summary.<lang>.md。立即返回，结果走事件不阻塞 UI。
 #[tauri::command]
 fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String> {
     let engine = config.translation_engine.as_str();
@@ -193,15 +207,32 @@ fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String
         return Err("重点提炼需 LLM 引擎（OpenAI 兼容 / Ollama）".to_string());
     }
     let path = transcript::latest_transcript(&app).ok_or("没有可提炼的译文记录")?;
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let segs = transcript::read_session(&path).map_err(|e| e.to_string())?;
+    // 摘要只用「有译文」的段：翻译失败的段译文为空，落盘保留但不喂给提炼 LLM
+    let content = segs
+        .iter()
+        .filter(|s| !s.translated.trim().is_empty())
+        .map(|s| format!("[原] {}\n[译] {}", s.original.trim(), s.translated.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     if content.trim().is_empty() {
-        return Err("本次会话还没有译文内容".to_string());
+        return Err("本次会话还没有可提炼的译文内容".to_string());
     }
     let summary_path = transcript::summary_path_for(&path, &config.target_lang);
     let app2 = app.clone();
+    debug_log(
+        &app,
+        &format!(
+            "summarize_session: start engine={} tgtLang={} chars={}",
+            engine,
+            config.target_lang,
+            content.chars().count()
+        ),
+    );
     std::thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
         {
             Ok(c) => c,
@@ -232,12 +263,17 @@ fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String
                 );
             }
         };
-        let final_text = match translate::summarize(&client, &config, &content, on_chunk) {
+        let on_stage = |s: &str| debug_log(&app2, &format!("summarize: {}", s));
+        let final_text = match translate::summarize(&client, &config, &content, on_chunk, on_stage) {
             Ok(s) => {
                 let _ = std::fs::write(&summary_path, &s);
+                debug_log(&app2, &format!("summarize_session: ok chars={}", s.chars().count()));
                 s
             }
-            Err(e) => format!("[提炼失败] {}", e),
+            Err(e) => {
+                debug_log(&app2, &format!("summarize_session: failed: {}", e));
+                format!("[提炼失败] {}", e)
+            }
         };
         let _ = app2.emit(
             "summary",
@@ -285,6 +321,29 @@ fn save_summary(app: AppHandle, content: String, target_lang: String) -> Result<
     std::fs::write(&summary_path, content).map_err(|e| e.to_string())
 }
 
+/// 重译单段（前端「重译此句」）：复用 translate()，但**不带多轮上下文**（单段独立请求，
+/// 质量略逊于流水线内重译，但无需依赖 pipeline 存活，停止后也可重译）。引擎/key 取当前 settings。
+#[tauri::command]
+async fn retranslate(original: String, config: RuntimeConfig) -> Result<String, String> {
+    if config.translation_engine == "none" {
+        return Err("纯字幕模式无需翻译".to_string());
+    }
+    if original.trim().is_empty() {
+        return Err("原文为空".to_string());
+    }
+    // HTTP 阻塞调用放到 blocking 线程池，别卡住 async runtime
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+        translate::translate(&client, &config, &original, &[], |_| {})
+            .map_err(|e| format!("{:#}", e))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 用系统文件管理器打开 transcripts 目录（存译文与摘要文件）。
 #[tauri::command]
 fn open_summary_dir(app: AppHandle) -> Result<(), String> {
@@ -295,6 +354,26 @@ fn open_summary_dir(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 列出历史会话（供「历史会话」面板），按时间倒序。
+#[tauri::command]
+fn list_sessions(app: AppHandle) -> Vec<transcript::SessionMeta> {
+    transcript::list_sessions(&app)
+}
+
+/// 读取某历史会话的全部段落（只读回看）。校验 path 落在 transcripts 目录内，防目录穿越。
+#[tauri::command]
+fn load_session(app: AppHandle, path: String) -> Result<Vec<transcript::Segment>, String> {
+    let dir = transcript::transcripts_dir(&app).ok_or("无译文目录")?;
+    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    let target = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !target.starts_with(&dir) {
+        return Err("非法的会话路径".to_string());
+    }
+    transcript::read_session(&target).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -303,6 +382,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_translation,
             stop_translation,
+            set_target_lang,
             toggle_overlay,
             model_exists,
             download_model,
@@ -311,7 +391,10 @@ pub fn run() {
             summarize_session,
             open_summary_dir,
             load_summary,
-            save_summary
+            save_summary,
+            retranslate,
+            list_sessions,
+            load_session
         ])
         // 启动时清理过期译文文件：读 settings.json 取保留天数/是否同删摘要（缺省 10/false）
         .setup(|app| {
