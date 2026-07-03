@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "VoiceTranslator",
+  "productName": "SeaStarVoiceTranslator",
   "version": "0.1.0",
-  "identifier": "com.administrator.voicetranslator",
+  "identifier": "com.seastar.voicetranslator",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "语音翻译 · Voice Translator",
+        "title": "海星同传 · SeaStar",
         "width": 920,
         "height": 680,
         "minWidth": 720,
@@ -45,8 +45,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
     "resources": [
-      "sidecar/models/silero_vad.onnx"
+      "sidecar/models/silero_vad.onnx",
+      "sidecar/models/campplus_sv_zh_16k.onnx"
     ],
     "icon": [
       "icons/32x32.png",

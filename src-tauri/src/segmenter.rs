@@ -88,6 +88,13 @@ impl Segmenter {
 pub struct SileroCore {
     vad: sherpa_onnx::VoiceActivityDetector,
     min_samples: usize,
+    // 句首前补（preroll）：sherpa 的 Silero 绑定没暴露 speech_pad_ms，输出段从「概率越过阈值那帧」
+    // 开始、不向前补，导致「不/碰/特」这类清辅音起头被切掉首音。这里自己实现 speech_pad_ms：
+    // 维护最近输入的环形缓冲 + 累计样本计数，取段时按 seg.start() 把开口前 pad 个样本补回段头。
+    ring: VecDeque<f32>, // 最近输入样本环形缓冲（与 vad 同步喂入）
+    ring_cap: usize,     // 环形缓冲容量（样本数）
+    fed: u64,            // 已喂入 vad 的累计样本数，与 seg.start() 同基准
+    pad: usize,          // 句首前补样本数
 }
 
 impl SileroCore {
@@ -110,15 +117,31 @@ impl SileroCore {
         let vad = sherpa_onnx::VoiceActivityDetector::create(&config, 30.0).ok_or_else(|| {
             anyhow::anyhow!("Silero VAD 初始化失败（模型缺失或加载错误）: {}", model.display())
         })?;
+        // preroll = 200ms：小于 min_silence_duration(0.5s)，保证补头窗口必落在句末静音里，
+        // 既补得回句首、又绝不会够到上一句尾音或复制本段已有样本。
+        let pad = SAMPLE_RATE * 200 / 1000;
+        // 环形缓冲要够长：取段发生在「段末 + 句末静音」之后，故 seg.start() 距当前已喂入样本可达
+        // 「单段最长 + 静音 + pad」。按引擎最长段 + 2s 余量留足，保证 start-pad 仍在缓冲内。
+        let ring_cap = (limits.silero_max_s.ceil() as usize + 2) * SAMPLE_RATE;
         Ok(Self {
             vad,
             min_samples: SAMPLE_RATE * 100 / 1000, // 100ms 以下丢弃
+            ring: VecDeque::with_capacity(ring_cap + SAMPLE_RATE),
+            ring_cap,
+            fed: 0,
+            pad,
         })
     }
 
     fn push(&mut self, samples: &[f32], out: &mut Vec<Vec<f32>>) {
         // sherpa VAD 内部按 window_size 缓冲处理，可直接喂任意长度。
         self.vad.accept_waveform(samples);
+        // 同步进环形缓冲，仅保留最近 ring_cap 个样本，供取段时补句首。
+        self.ring.extend(samples.iter().copied());
+        while self.ring.len() > self.ring_cap {
+            self.ring.pop_front();
+        }
+        self.fed += samples.len() as u64;
         self.drain(out);
     }
 
@@ -126,7 +149,21 @@ impl SileroCore {
         while let Some(seg) = self.vad.front() {
             let samples = seg.samples();
             if samples.len() >= self.min_samples {
-                out.push(samples.to_vec());
+                let start = seg.start().max(0) as u64;
+                // 环形缓冲里最早样本的绝对下标。
+                let ring_base = self.fed.saturating_sub(self.ring.len() as u64);
+                // 期望补头区间 [pad_start, start)，与段本身 [start, start+n) 相邻不重叠。
+                let pad_start = start.saturating_sub(self.pad as u64);
+                let mut seg_out = Vec::with_capacity(self.pad + samples.len());
+                if pad_start < start && pad_start >= ring_base {
+                    let from = (pad_start - ring_base) as usize;
+                    let to = (start - ring_base) as usize;
+                    if to <= self.ring.len() {
+                        seg_out.extend(self.ring.iter().copied().skip(from).take(to - from));
+                    }
+                }
+                seg_out.extend_from_slice(samples);
+                out.push(seg_out);
             }
             drop(seg);
             self.vad.pop();

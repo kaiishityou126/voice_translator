@@ -3,9 +3,12 @@ mod capture;
 mod config;
 mod denoise;
 mod pipeline;
+mod playback;
 mod segmenter;
 mod transcript;
 mod translate;
+mod tts;
+mod voiceprint;
 
 use std::sync::{Arc, Mutex};
 
@@ -16,9 +19,14 @@ use pipeline::PipelineHandle;
 
 #[derive(Default)]
 struct AppState {
+    /// 入站流水线：听对方 → 译中文字幕（你看）
     pipeline: Mutex<Option<PipelineHandle>>,
-    /// 进程内识别器（SenseVoice / Qwen3）；引擎或源语言变更时重建。
+    /// 出站流水线：你说话 → 译目标语言 → TTS 回灌（对方听）
+    pipeline_out: Mutex<Option<PipelineHandle>>,
+    /// 入站进程内识别器（SenseVoice / Qwen3）；引擎或源语言变更时重建。
     recognizer: Mutex<Option<Arc<dyn asr::Asr>>>,
+    /// 出站识别器（你说话用，源语言与入站不同，独立一份）。
+    recognizer_out: Mutex<Option<Arc<dyn asr::Asr>>>,
 }
 
 /// emit("summary", ...) 负载：与字幕流式同思路。pending=true 增量帧（全量累计），false 终态。
@@ -84,43 +92,82 @@ fn start_translation(
     );
     // 1. 设备自检（友好报错）
     capture::probe(&config.source).map_err(|e| format!("音频设备不可用: {}", e))?;
+    if config.tts_enabled && config.translation_engine != "none" {
+        capture::probe("microphone").map_err(|e| format!("麦克风不可用（回灌需麦克风）: {}", e))?;
+    }
 
     // 1.5 模型按需下载：缺失则让前端先触发下载
     if !asr::model_present(&app, &config.asr_engine) {
         return Err("MODEL_MISSING".to_string());
     }
 
-    // 2. 加载/复用进程内识别器（引擎或源语言变更时重建）
+    // 按当前 CPU 核数分配推理线程（点开始现查）：入站恒定(与回灌无关→不重载)，回灌出站/TTS 压缩防超订。
+    let plan = asr::plan_threads(&config.asr_engine);
+
+    // 回灌(双向)模式：麦克风归出站独占，入站必须听系统声音，否则入站会把你自己说的话再转一遍
+    let relay_on = config.tts_enabled && config.translation_engine != "none";
+    // 回灌预检：虚拟声卡缺失则在启动任何流水线前就返回，避免入站已起、出站才失败的半启动残留
+    // （spawn_outbound 内仍保留同款检查作自包含兜底；此处提前后，缺声卡时那道分支不可达）。
+    if relay_on && config.output_device.is_empty() && !playback::cable_present() {
+        return Err("CABLE_MISSING".to_string());
+    }
+    // 入站有效语言：回灌模式用回灌独立配置(对方说→识别源, 你的语言→译文/你读)，否则用首页源/目标
+    let (in_source_lang, in_target_lang) = if relay_on {
+        (config.relay_inbound_source_lang.clone(), config.relay_my_lang.clone())
+    } else {
+        (config.source_lang.clone(), config.target_lang.clone())
+    };
+
+    // 2. 加载/复用进程内识别器（引擎或源/目标语言变更时重建）
     let recognizer = {
         let mut guard = state.recognizer.lock().unwrap();
-        let desired = asr::fingerprint_for(&config.asr_engine, &config.source_lang, &config.target_lang);
+        let desired = asr::fingerprint_for(&config.asr_engine, &in_source_lang, &in_target_lang);
         let need_reload = match guard.as_ref() {
             Some(a) => a.fingerprint() != desired,
             None => true,
         };
         if need_reload {
             *guard = None;
-            let a = asr::load(&app, &config.asr_engine, &config.source_lang, &config.target_lang)
+            let a = asr::load(&app, &config.asr_engine, &in_source_lang, &in_target_lang, plan.inbound_asr)
                 .map_err(|e| e.to_string())?;
             *guard = Some(a);
         }
         guard.as_ref().unwrap().clone()
     };
 
-    // 3. 停掉可能在跑的旧流水线
+    // 3. 停掉可能在跑的旧流水线（入站 + 出站）
     if let Some(h) = state.pipeline.lock().unwrap().take() {
         h.stop();
     }
+    if let Some(h) = state.pipeline_out.lock().unwrap().take() {
+        h.stop();
+    }
 
-    // 4. 启动新流水线（VAD 选择由 config.silero_vad 决定；Silero 模型已内嵌在 crate 中）
-    let handle = pipeline::start(app, recognizer, config);
+    // 3.5 入站流水线：听对方 → 译你的语言字幕，写存档，不回灌
+    let mut in_cfg = config.clone();
+    in_cfg.tts_enabled = false;
+    in_cfg.write_transcript = true;
+    in_cfg.source_lang = in_source_lang;
+    in_cfg.target_lang = in_target_lang;
+    if relay_on {
+        in_cfg.source = "loopback".to_string();
+    }
+    let handle = pipeline::start(app.clone(), recognizer, None, None, "in", in_cfg);
     *state.pipeline.lock().unwrap() = Some(handle);
+
+    // 3.6 出站流水线（开启回灌时）：你说话 → 译文/原声 → 虚拟声卡（预检 + 原声直通分支见 spawn_outbound）
+    if relay_on {
+        spawn_outbound(&app, state.inner(), &config, plan.relay_asr, plan.relay_tts)?;
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn stop_translation(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     if let Some(h) = state.pipeline.lock().unwrap().take() {
+        h.stop();
+    }
+    if let Some(h) = state.pipeline_out.lock().unwrap().take() {
         h.stop();
     }
     // 无论谁触发停止（主窗 / 悬浮窗），都向所有窗口补发权威 idle，保证两窗联动。
@@ -137,6 +184,108 @@ fn set_target_lang(state: State<AppState>, target_lang: String) {
     }
 }
 
+/// 构建并启动出站(回灌)流水线，存入 state.pipeline_out。含 CABLE / TTS 模型 / 语种预检。
+/// relay_asr / relay_tts 为按引擎分配的推理线程数（调用方从 asr::plan_threads 取）。
+fn spawn_outbound(
+    app: &AppHandle,
+    state: &AppState,
+    config: &RuntimeConfig,
+    relay_asr: i32,
+    relay_tts: i32,
+) -> Result<(), String> {
+    // 虚拟声卡未装则提示安装（output_device 为空走自动检测）——译文/原声都需要
+    if config.output_device.is_empty() && !playback::cable_present() {
+        return Err("CABLE_MISSING".to_string());
+    }
+    // 原声直通：麦克风 → CABLE，不识别/翻译/合成 → 跳过 TTS 模型 + 语种限制。
+    if config.relay_passthrough {
+        let mut out_cfg = config.clone();
+        out_cfg.source = "microphone".to_string();
+        let h = pipeline::start_passthrough(app.clone(), out_cfg);
+        *state.pipeline_out.lock().unwrap() = Some(h);
+    } else {
+        if !tts::model_present(app) {
+            return Err("TTS_MODEL_MISSING".to_string());
+        }
+        // 出站识别器（你说话）：源语言取回灌·你的语言（relay_my_lang，具体语种）。
+        // SenseVoice 只认 zh/en/ja/ko/yue；Qwen3 多语不受此限。
+        let out_src_lang = config.relay_my_lang.clone();
+        if config.asr_engine != "qwen3Asr"
+            && !matches!(out_src_lang.as_str(), "auto" | "zh" | "en" | "ja" | "ko" | "yue")
+        {
+            return Err("RELAY_LANG_UNSUPPORTED".to_string());
+        }
+        let rec_out = {
+            let mut guard = state.recognizer_out.lock().unwrap();
+            let desired = asr::fingerprint_for(&config.asr_engine, &out_src_lang, &config.tts_target_lang);
+            let need = guard.as_ref().map_or(true, |a| a.fingerprint() != desired);
+            if need {
+                *guard = None;
+                let a = asr::load(app, &config.asr_engine, &out_src_lang, &config.tts_target_lang, relay_asr)
+                    .map_err(|e| e.to_string())?;
+                *guard = Some(a);
+            }
+            guard.as_ref().unwrap().clone()
+        };
+        let mut out_cfg = config.clone();
+        out_cfg.source = "microphone".to_string();
+        out_cfg.source_lang = out_src_lang;
+        out_cfg.target_lang = config.tts_target_lang.clone();
+        out_cfg.write_transcript = false;
+        let tts_engine = tts::Tts::load(app, out_cfg.tts_lang(), relay_tts).map_err(|e| e.to_string())?;
+        // 声纹门控（仅出站）：开启且已登记 → 加载提取器 + 登记向量构门；否则 None 自动降级。
+        let gate = if config.voiceprint_gate && voiceprint::exists(app) {
+            match (voiceprint::Extractor::load(app, 1), voiceprint::load(app)) {
+                (Ok(ext), Some(enrolled)) => Some(voiceprint::Gate::new(
+                    std::sync::Arc::new(ext),
+                    enrolled,
+                    config.voiceprint_threshold,
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let h = pipeline::start(app.clone(), rec_out, Some(tts_engine), gate, "out", out_cfg);
+        *state.pipeline_out.lock().unwrap() = Some(h);
+    }
+    Ok(())
+}
+
+/// 运行中热切「原声」：仅换出站流水线（译文↔原声直通），入站不动。
+/// 预检先行（不动现有出站），通过后才停旧起新；失败则原出站继续跑。
+#[tauri::command]
+async fn set_relay_passthrough(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: RuntimeConfig,
+) -> Result<(), String> {
+    // 仅回灌运行中有意义
+    if !(config.tts_enabled && config.translation_engine != "none") {
+        return Ok(());
+    }
+    // 预检：失败则保持原出站不动
+    if config.output_device.is_empty() && !playback::cable_present() {
+        return Err("CABLE_MISSING".to_string());
+    }
+    if !config.relay_passthrough {
+        if !tts::model_present(&app) {
+            return Err("TTS_MODEL_MISSING".to_string());
+        }
+        if config.asr_engine != "qwen3Asr"
+            && !matches!(config.relay_my_lang.as_str(), "auto" | "zh" | "en" | "ja" | "ko" | "yue")
+        {
+            return Err("RELAY_LANG_UNSUPPORTED".to_string());
+        }
+    }
+    // 预检通过 → 停旧出站、起新出站（入站流水线不动）
+    if let Some(h) = state.pipeline_out.lock().unwrap().take() {
+        h.stop();
+    }
+    let plan = asr::plan_threads(&config.asr_engine);
+    spawn_outbound(&app, state.inner(), &config, plan.relay_asr, plan.relay_tts)
+}
+
 /// 指定 ASR 引擎的模型是否已下载到数据目录。
 #[tauri::command]
 fn model_exists(app: AppHandle, engine: String) -> bool {
@@ -147,6 +296,115 @@ fn model_exists(app: AppHandle, engine: String) -> bool {
 #[tauri::command]
 fn download_model(app: AppHandle, engine: String) -> Result<(), String> {
     asr::download(&app, &engine).map_err(|e| e.to_string())
+}
+
+/// Kokoro TTS 模型是否已下载。
+#[tauri::command]
+fn tts_model_exists(app: AppHandle) -> bool {
+    tts::model_present(&app)
+}
+
+/// 按需下载 Kokoro TTS 模型（进度走 "tts-progress" 事件）。
+#[tauri::command]
+fn download_tts_model(app: AppHandle) -> Result<(), String> {
+    tts::download(&app).map_err(|e| e.to_string())
+}
+
+/// 是否已登记声纹。
+#[tauri::command]
+fn voiceprint_exists(app: AppHandle) -> bool {
+    voiceprint::exists(&app)
+}
+
+/// 清除登记声纹。
+#[tauri::command]
+fn clear_voiceprint(app: AppHandle) -> Result<(), String> {
+    voiceprint::clear(&app).map_err(|e| e.to_string())
+}
+
+/// 登记「你的声音」：录 ~5s 麦克风语音 → 提取声纹 → 存 voiceprint.json。
+/// 方案 A：仅在同传未运行时可登记（麦克风被采集线程占用则拒绝，避免抢设备）。
+#[tauri::command]
+fn enroll_voiceprint(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    if state.pipeline.lock().unwrap().is_some() || state.pipeline_out.lock().unwrap().is_some() {
+        return Err("同传运行中无法登记，请先停止再登记声纹".to_string());
+    }
+    if voiceprint::model_path(&app).is_none() {
+        return Err("声纹模型缺失（安装包资源未解析到）".to_string());
+    }
+
+    // 复用采集线程录麦克风：它已处理平台采集 + 降噪 + 重采样到 16k + VAD 切段，直接收 16k 语音段。
+    let stop = Arc::new(AtomicBool::new(false));
+    let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(6);
+    let limits = segmenter::SegLimits::for_engine("senseVoice");
+    let cap_stop = stop.clone();
+    let cap_app = app.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = capture::capture_thread(
+            "microphone",
+            true,
+            true,
+            0.01,
+            1000,
+            limits,
+            cap_stop,
+            seg_tx,
+            cap_app,
+        );
+    });
+
+    // 收满 ~3s 语音或 10s 超时收工（VAD 只在你说话时出段，静音不计）。
+    let mut buf: Vec<f32> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while buf.len() < 16_000 * 3 && Instant::now() < deadline {
+        match seg_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(seg) => buf.extend_from_slice(&seg),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+
+    if buf.len() < 16_000 {
+        return Err("没采到足够语音，请对着麦克风清晰说 3~5 秒再试".to_string());
+    }
+    let ext = voiceprint::Extractor::load(&app, 2).map_err(|e| e.to_string())?;
+    let emb = ext
+        .embed(&buf)
+        .ok_or_else(|| "声纹提取失败，请重试".to_string())?;
+    voiceprint::save(&app, &emb).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 枚举输出（播放）设备友好名，供回灌选 CABLE Input。
+#[tauri::command]
+fn list_output_devices() -> Vec<String> {
+    playback::list_output_devices()
+}
+
+/// 是否装了虚拟声卡（CABLE Input），供前端判断是否提示装 VB-Cable。
+#[tauri::command]
+fn cable_exists() -> bool {
+    playback::cable_present()
+}
+
+/// 当前操作系统（"windows"/"macos"/"linux"/"other"），供前端按平台切换虚拟声卡文案（VB-Cable / BlackHole）。
+#[tauri::command]
+fn get_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
 }
 
 /// 开/关悬浮字幕窗（conf 定义的独立窗口，加载 overlay.html）。
@@ -208,15 +466,22 @@ fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String
     }
     let path = transcript::latest_transcript(&app).ok_or("没有可提炼的译文记录")?;
     let segs = transcript::read_session(&path).map_err(|e| e.to_string())?;
-    // 摘要只用「有译文」的段：翻译失败的段译文为空，落盘保留但不喂给提炼 LLM
+    // 逐段回退：有译文给「原+译」，翻译失败（译文空）的段仍给原文（只给 [原]，不写空/假的 [译] 误导模型）；
+    // 原文译文都空才真正跳过。翻译整场失败时也能凭原文提炼，LLM 自行边理解边纳入目标语纪要。
     let content = segs
         .iter()
-        .filter(|s| !s.translated.trim().is_empty())
-        .map(|s| format!("[原] {}\n[译] {}", s.original.trim(), s.translated.trim()))
+        .filter(|s| !s.original.trim().is_empty() || !s.translated.trim().is_empty())
+        .map(|s| {
+            if s.translated.trim().is_empty() {
+                format!("[原] {}", s.original.trim())
+            } else {
+                format!("[原] {}\n[译] {}", s.original.trim(), s.translated.trim())
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     if content.trim().is_empty() {
-        return Err("本次会话还没有可提炼的译文内容".to_string());
+        return Err("本次会话还没有可提炼的内容".to_string());
     }
     let summary_path = transcript::summary_path_for(&path, &config.target_lang);
     let app2 = app.clone();
@@ -383,9 +648,18 @@ pub fn run() {
             start_translation,
             stop_translation,
             set_target_lang,
+            set_relay_passthrough,
             toggle_overlay,
             model_exists,
             download_model,
+            tts_model_exists,
+            download_tts_model,
+            voiceprint_exists,
+            clear_voiceprint,
+            enroll_voiceprint,
+            list_output_devices,
+            cable_exists,
+            get_platform,
             load_settings,
             save_settings,
             summarize_session,

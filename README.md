@@ -1,4 +1,4 @@
-# 语音翻译 · Voice Translator
+# 海星同传 · SeaStar Voice Translator
 
 实时语音翻译桌面应用：捕获**电脑系统音频**（或麦克风）→ 本地语音识别 → 翻译 → 双栏字幕实时显示。中 / 英 / 日 三语互译。
 
@@ -39,7 +39,7 @@
 
 前置：Node 18+、Rust(stable-msvc)、WebView2（Win11 自带）。
 
-**识别模型不用手动下**——首次「开始」时按所选引擎自动下载到 app 数据目录（`%APPDATA%\com.administrator.voicetranslator\models`），带进度条。仓库内已含 VAD 所需的 `src-tauri/sidecar/models/silero_vad.onnx`（约 2.2MB，随安装包打包）。
+**识别模型不用手动下**——首次「开始」时按所选引擎自动下载到 app 数据目录（`%APPDATA%\com.seastar.voicetranslator\models`），带进度条。仓库内已含 VAD 所需的 `src-tauri/sidecar/models/silero_vad.onnx`（约 2.2MB，随安装包打包）。
 
 ```powershell
 npm install

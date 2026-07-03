@@ -28,6 +28,8 @@ src-tauri/sidecar/*
 !src-tauri/sidecar/models/
 src-tauri/sidecar/models/*
 !src-tauri/sidecar/models/silero_vad.onnx
+# 例外：说话人声纹模型（CAM++，27MB），tauri 打包必需资源，需入库
+!src-tauri/sidecar/models/campplus_sv_zh_16k.onnx
 
 # Editor directories and files
 .vscode/*

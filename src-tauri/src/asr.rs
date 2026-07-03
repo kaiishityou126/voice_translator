@@ -40,6 +40,32 @@ pub fn fingerprint_for(engine: &str, language: &str, target_lang: &str) -> Strin
     }
 }
 
+/// 点「开始」时按当前 CPU 核数算出的线程分配。
+/// - `inbound_asr`：入站(听对方)ASR = 非回灌 ASR。与是否回灌无关(恒定 → 缓存的入站识别器永不因回灌重载)。
+/// - `relay_asr` / `relay_tts`：仅回灌用的出站 ASR / TTS，压缩以避免"入站+出站+TTS"三路并发超订。
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadPlan {
+    pub inbound_asr: i32,
+    pub relay_asr: i32,
+    pub relay_tts: i32,
+}
+
+/// 现查逻辑核数(取不到兜底 4),按引擎算线程分配。cap 用各自现默认(不追求大核加速)。
+/// 入站单模型给较多(cores-1);回灌三路并发按 (cores-2)/3 压缩;下限 2。
+pub fn plan_threads(engine: &str) -> ThreadPlan {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+    let asr_cap = if engine == "qwen3Asr" { 6 } else { 4 };
+    let tts_cap = 4;
+    let relay_share = (cores - 2) / 3;
+    ThreadPlan {
+        inbound_asr: (cores - 1).clamp(2, asr_cap),
+        relay_asr: relay_share.clamp(2, asr_cap),
+        relay_tts: relay_share.clamp(2, tts_cap),
+    }
+}
+
 /// 按引擎判断模型是否已就绪。
 pub fn model_present(app: &AppHandle, engine: &str) -> bool {
     match engine {
@@ -57,16 +83,22 @@ pub fn download(app: &AppHandle, engine: &str) -> Result<()> {
 }
 
 /// 按引擎加载识别器（首次加载：SenseVoice ~1~2s，Qwen3 ~5s）。
-pub fn load(app: &AppHandle, engine: &str, language: &str, target_lang: &str) -> Result<Arc<dyn Asr>> {
+pub fn load(
+    app: &AppHandle,
+    engine: &str,
+    language: &str,
+    target_lang: &str,
+    num_threads: i32,
+) -> Result<Arc<dyn Asr>> {
     match engine {
-        "qwen3Asr" => Ok(Arc::new(Qwen3Asr::load(app)?)),
+        "qwen3Asr" => Ok(Arc::new(Qwen3Asr::load(app, num_threads)?)),
         _ => {
             let lang = if language.is_empty() { "auto" } else { language };
             // source_lang=auto：base LID 逐段判语种 → 路由到对应固定识别器;目标语言走常驻 auto
             if lang == "auto" {
-                Ok(Arc::new(AutoSenseVoice::load(app, target_lang)?))
+                Ok(Arc::new(AutoSenseVoice::load(app, target_lang, num_threads)?))
             } else {
-                Ok(Arc::new(SenseVoice::load(app, lang)?))
+                Ok(Arc::new(SenseVoice::load(app, lang, num_threads)?))
             }
         }
     }
@@ -284,7 +316,8 @@ pub struct SenseVoice {
 
 impl SenseVoice {
     /// 加载模型创建识别器。`language` 为源语言；"auto" 让模型自检（短片段固定语种更准）。
-    pub fn load(app: &AppHandle, language: &str) -> Result<Self> {
+    /// `num_threads` 由上层按 CPU 核数分配（见 `plan_threads`）。
+    pub fn load(app: &AppHandle, language: &str, num_threads: i32) -> Result<Self> {
         let dir = models_dir(app)?;
         let model = dir.join(MODEL_FILE);
         let tokens = dir.join(TOKENS_FILE);
@@ -297,8 +330,8 @@ impl SenseVoice {
             use_itn: true,
         };
         config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
-        // 低功耗 CPU 默认单线程偏慢；用 4 线程吃满多核加速推理（这台无 GPU，纯 CPU）。
-        config.model_config.num_threads = 4;
+        // 纯 CPU 推理，线程数按核数分配（回灌时压缩防超订）。
+        config.model_config.num_threads = num_threads;
 
         let recognizer = OfflineRecognizer::create(&config)
             .ok_or_else(|| anyhow!("创建 SenseVoice 识别器失败（模型文件损坏？）"))?;
@@ -341,13 +374,15 @@ pub struct AutoSenseVoice {
     pool: Mutex<Vec<SenseVoice>>,
     /// 上一段判定的语种，用于短段/判失败时继承。
     last_lang: Mutex<String>,
+    /// 每个 SenseVoice 识别器的推理线程数（现建池成员时沿用），由上层按核数分配。
+    threads: i32,
 }
 
 /// 外语固定识别器封顶数(auto 不计入)；峰值常驻 = auto + POOL_CAP 个，约 (1+POOL_CAP)×228MB。
 const POOL_CAP: usize = 2;
 
 impl AutoSenseVoice {
-    pub fn load(app: &AppHandle, target_lang: &str) -> Result<Self> {
+    pub fn load(app: &AppHandle, target_lang: &str, num_threads: i32) -> Result<Self> {
         let dir = models_dir(app)?;
         let config = SpokenLanguageIdentificationConfig {
             whisper: SpokenLanguageIdentificationWhisperConfig {
@@ -355,14 +390,15 @@ impl AutoSenseVoice {
                 decoder: Some(dir.join(LID_DECODER).to_string_lossy().into_owned()),
                 tail_paddings: 0,
             },
-            num_threads: 2,
+            // LID 轻量，封顶 2 线程即可（与逐段 SenseVoice 串行执行，不叠加峰值）。
+            num_threads: num_threads.min(2),
             debug: false,
             provider: Some("cpu".to_string()),
         };
         let lid = SpokenLanguageIdentification::create(&config)
             .ok_or_else(|| anyhow!("创建 Whisper 语种识别器失败（模型文件损坏？）"))?;
         // 常驻 auto：兼目标语言识别 + 判不出时兜底
-        let auto = SenseVoice::load(app, "auto")?;
+        let auto = SenseVoice::load(app, "auto", num_threads)?;
         let target = if target_lang.is_empty() {
             "zh".to_string()
         } else {
@@ -375,6 +411,7 @@ impl AutoSenseVoice {
             auto: Mutex::new(auto),
             pool: Mutex::new(Vec::new()),
             last_lang: Mutex::new(String::new()),
+            threads: num_threads,
         })
     }
 
@@ -388,8 +425,8 @@ impl AutoSenseVoice {
             pool.push(sv); // 回到尾部=最近使用
             return out;
         }
-        // 池中没有：现建
-        match SenseVoice::load(&self.app, lang) {
+        // 池中没有：现建（沿用本 Auto 识别器的线程数）
+        match SenseVoice::load(&self.app, lang, self.threads) {
             Ok(sv) => {
                 let out = sv.transcribe(samples);
                 pool.push(sv);
@@ -414,13 +451,18 @@ impl AutoSenseVoice {
         if samples.len() < 16_000 * 3 / 2 {
             return "auto".to_string();
         }
+        // 语种判别只需开头几秒：把喂给 LID 的音频截到前 4s（转写仍用完整段，不影响识别文字）。
+        // sherpa 的 whisper LID 耗时随输入长度增长（已去掉固定 30s 补零），截断能明显降 LID 延迟。
+        const LID_MAX_SAMPLES: usize = 16_000 * 4; // 判语种最多看前 4s
+        let head = &samples[..samples.len().min(LID_MAX_SAMPLES)];
         let stream = self.lid.create_stream();
-        stream.accept_waveform(16_000, samples);
+        stream.accept_waveform(16_000, head);
         let raw = self.lid.compute(&stream).map(|r| r.lang).unwrap_or_default();
-        // 诊断：打印本段时长与 LID 原始输出，定位判错/判空
+        // 诊断：段总长 + 实际喂给 LID 的长度 + LID 原始输出，定位判错/判空
         eprintln!(
-            "[lid] dur={:.2}s raw=\"{}\"",
+            "[lid] seg={:.2}s lid_in={:.2}s raw=\"{}\"",
             samples.len() as f32 / 16_000.0,
+            head.len() as f32 / 16_000.0,
             raw
         );
         match raw.as_str() {
@@ -476,8 +518,8 @@ pub struct Qwen3Asr {
 }
 
 impl Qwen3Asr {
-    /// 加载 Qwen3 四组件创建识别器（num_threads=6 实测最优）。
-    pub fn load(app: &AppHandle) -> Result<Self> {
+    /// 加载 Qwen3 四组件创建识别器；`num_threads` 由上层按核数分配（现默认上限 6）。
+    pub fn load(app: &AppHandle, num_threads: i32) -> Result<Self> {
         let dir = qwen3_dir(app)?;
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
 
@@ -495,7 +537,7 @@ impl Qwen3Asr {
             hotwords: None,
             ..Default::default()
         };
-        config.model_config.num_threads = 6;
+        config.model_config.num_threads = num_threads;
 
         let recognizer = OfflineRecognizer::create(&config)
             .ok_or_else(|| anyhow!("创建 Qwen3-ASR 识别器失败（模型文件损坏？）"))?;
@@ -558,6 +600,16 @@ pub fn is_filler_hallucination(text: &str) -> bool {
         "Thank you for watching",
         "Thanks for watching",
         "you",
+        // 英文静音幻觉高频词：非实义应答词/告别语/语气词，整段恰为这些时按幻觉丢弃
+        // （会议/视频翻译场景里，单独一句这些几乎都是底噪幻觉；偶尔误伤一句真实短应答可接受）
+        "Yeah",
+        "Yep",
+        "Bye",
+        "Bye-bye",
+        "Uh",
+        "Um",
+        "Hmm",
+        "Mm",
         "ご視聴ありがとうございました",
         "ご清聴ありがとうございました",
         "おやすみなさい",
@@ -617,6 +669,10 @@ mod tests {
         assert!(is_filler_hallucination("Thank you."));
         assert!(is_filler_hallucination(" thank you "));
         assert!(is_filler_hallucination("ご視聴ありがとうございました"));
+        // 英文静音幻觉词
+        assert!(is_filler_hallucination("Yeah."));
+        assert!(is_filler_hallucination(" yeah "));
+        assert!(is_filler_hallucination("Bye."));
         // 正常句子里含 "you" 不应被误伤
         assert!(!is_filler_hallucination("Thank you for the tsunami warning today."));
         assert!(!is_filler_hallucination("気象庁は津波注意報を発表しています。"));

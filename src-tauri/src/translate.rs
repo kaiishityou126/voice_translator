@@ -333,7 +333,7 @@ pub fn summarize(
     // 装得下（≤ 安全上限）→ 一次性走结构化提炼（短会话无感，行为同旧版）
     if total <= safe_call {
         on_stage(&format!("单段直提：{} 字", total));
-        let desc = "下面是一段实时转录的双语记录（[原] 原文 / [译] 译文，可能不完整、有口语冗余、识别有误）。";
+        let desc = "下面是一段实时转录记录（[原] 原文 / [译] 译文，多为目标语译文；部分段翻译失败仅有源语原文、可能多语种混杂，识别也可能有误、有口语冗余）。请统一归纳成目标语纪要。";
         return summarize_structured(client, cfg, transcript, desc, &mut on_chunk);
     }
 
@@ -519,7 +519,7 @@ fn summarize_map_chunk(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let lang_native = target_lang_native(cfg);
     let system = format!(
-        "下面是一段实时转录双语记录的一个片段（[原] 原文 / [译] 译文，可能不完整、有口语冗余、识别有误；也可能本身已是上一轮要点）。\
+        "下面是一段实时转录记录的一个片段（[原] 原文 / [译] 译文，多为目标语译文；部分段翻译失败仅有源语原文、可能多语种混杂，识别也可能有误、有口语冗余；也可能本身已是上一轮要点）。\
          用「{lang_native}」先把内容归到几个话题，每个话题一条要点：事件、事实、数字、人名、明确话题。\
          唱歌、歌词、语气词、寒暄、口水话只合并成一句带过（如「演唱了《X》等歌曲」），没信息的不列。\
          无名无实的零碎情节（如「某人决定加油」「某人向某人求救」这种没人名没数字的口水）不要单列，归不进话题就丢掉。\
@@ -768,6 +768,9 @@ fn google_lang(code: &str, allow_auto: bool) -> &'static str {
         "es" => "es",
         "de" => "de",
         "ru" => "ru",
+        "hi" => "hi",
+        "it" => "it",
+        "pt" => "pt",
         _ => {
             if allow_auto {
                 "auto"

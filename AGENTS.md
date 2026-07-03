@@ -1,4 +1,4 @@
-# Voice Translator — AI 代理指南
+# 海星同传 SeaStar — AI 代理指南
 
 实时语音翻译桌面应用:捕获系统音频(WASAPI 环回)或麦克风 → 本地 sherpa-onnx SenseVoice 识别 → 云端/本地翻译 → 双语字幕 + 可选悬浮窗。**隐私**:音频不出本机,只有识别后的文本发往翻译 API。
 
@@ -18,7 +18,7 @@ npm run build                # 仅前端 TypeScript 类型检查 + 打包
 cd src-tauri; cargo check    # 仅 Rust 编译检查
 ```
 
-**识别引擎**:sherpa-onnx 静态链接进程内运行(无 sidecar、无 HTTP)。SenseVoice int8 模型(`sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09`,约 237MB,支持 zh/en/ja/ko/yue)不打包,首次使用按需下载到 `%APPDATA%\com.administrator.voicetranslator\models\`。另需 `src-tauri/sidecar/models/silero_vad.onnx` 用于 VAD 分段。
+**识别引擎**:sherpa-onnx 静态链接进程内运行(无 sidecar、无 HTTP)。SenseVoice int8 模型(`sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09`,约 237MB,支持 zh/en/ja/ko/yue)不打包,首次使用按需下载到 `%APPDATA%\com.seastar.voicetranslator\models\`。另需 `src-tauri/sidecar/models/silero_vad.onnx` 用于 VAD 分段。
 
 ## 架构:三线程流水线
 

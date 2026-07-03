@@ -243,6 +243,59 @@ mod platform {
         };
         Ok(())
     }
+
+    /// 原声直通采集：麦克风原始 48k 单声道帧连续发往 frame_tx（不降噪/不切段/不识别）。
+    pub fn raw_mic_thread(
+        stop: Arc<AtomicBool>,
+        frame_tx: SyncSender<Vec<f32>>,
+        _app: AppHandle,
+    ) -> Result<()> {
+        init_com()?;
+        let enumerator = DeviceEnumerator::new()?;
+        let device = enumerator.get_default_device(&Direction::Capture)?;
+        let mut audio_client = device.get_iaudioclient()?;
+        let desired_format = WaveFormat::new(32, 32, &SampleType::Float, CAPTURE_RATE, 2, None);
+        let blockalign = desired_format.get_blockalign() as usize;
+        let (_def_time, min_time) = audio_client.get_device_period()?;
+        let mode = StreamMode::EventsShared {
+            autoconvert: true,
+            buffer_duration_hns: min_time,
+        };
+        audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
+        let h_event = audio_client.set_get_eventhandle()?;
+        let capture_client = audio_client.get_audiocaptureclient()?;
+        audio_client.start_stream()?;
+        let mut byte_queue: VecDeque<u8> = VecDeque::with_capacity(blockalign * CAPTURE_RATE);
+        while !stop.load(Ordering::Relaxed) {
+            let frames = byte_queue.len() / blockalign;
+            if frames > 0 {
+                let mut mono48 = Vec::<f32>::with_capacity(frames);
+                for _ in 0..frames {
+                    let l = pop_f32(&mut byte_queue);
+                    let r = pop_f32(&mut byte_queue);
+                    mono48.push((l + r) * 0.5);
+                }
+                match frame_tx.try_send(mono48) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {} // 丢弃一帧保持实时
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        audio_client.stop_stream().ok();
+                        return Ok(());
+                    }
+                }
+            }
+            let before = byte_queue.len();
+            let info = capture_client.read_from_device_to_deque(&mut byte_queue)?;
+            if info.flags.silent {
+                for b in byte_queue.iter_mut().skip(before) {
+                    *b = 0;
+                }
+            }
+            let _ = h_event.wait_for_event(200);
+        }
+        audio_client.stop_stream().ok();
+        Ok(())
+    }
 }
 
 // ======================== macOS：麦克风(cpal) + 系统音频(ScreenCaptureKit) ========================
@@ -554,6 +607,73 @@ mod platform {
             _ => bail!("不支持的来源: {}", source),
         }
     }
+
+    /// 原声直通采集：麦克风原始 48k 单声道帧连续发往 frame_tx（不降噪/不切段/不识别）。
+    pub fn raw_mic_thread(
+        stop: Arc<AtomicBool>,
+        frame_tx: SyncSender<Vec<f32>>,
+        _app: AppHandle,
+    ) -> Result<()> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("未找到麦克风"))?;
+        let config: cpal::StreamConfig = device.default_input_config()?.into();
+        let src_rate = config.sample_rate.0;
+        let channels = config.channels as usize;
+
+        let (raw_tx, raw_rx) = channel::<Vec<f32>>();
+        let err_fn = |e| eprintln!("[capture] cpal 输入流错误: {}", e);
+        let stream = match config.channels {
+            1 => {
+                let tx = raw_tx.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let _ = tx.send(data.to_vec());
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            _ => {
+                let tx = raw_tx.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        downmix_send(data, channels, &tx);
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+        };
+        drop(raw_tx);
+        stream.play()?;
+
+        let mut resampler = Resampler::new(src_rate);
+        let mut mono48 = Vec::<f32>::with_capacity(CAPTURE_RATE);
+        while !stop.load(Ordering::Relaxed) {
+            match raw_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(chunk) => {
+                    mono48.clear();
+                    if src_rate == CAPTURE_RATE as u32 {
+                        mono48.extend_from_slice(&chunk);
+                    } else {
+                        resampler.process(&chunk, &mut mono48);
+                    }
+                    match frame_tx.try_send(mono48.clone()) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {} // 丢弃一帧保持实时
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
 }
 
 // ======================== Linux：麦克风(cpal) + 系统音频(PipeWire/PulseAudio monitor) ========================
@@ -849,3 +969,16 @@ mod platform {
 }
 
 pub use platform::{capture_thread, probe};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub use platform::raw_mic_thread;
+
+/// 非 Windows/macOS：原声直通未实现（回灌播放这些平台也未支持）。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn raw_mic_thread(
+    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _frame_tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    _app: tauri::AppHandle,
+) -> anyhow::Result<()> {
+    anyhow::bail!("当前平台未实现原声直通采集")
+}

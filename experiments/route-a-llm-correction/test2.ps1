@@ -3,7 +3,7 @@
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$p = "$env:APPDATA\com.administrator.voicetranslator\settings.json"
+$p = "$env:APPDATA\com.seastar.voicetranslator\settings.json"
 $s = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
 $base = $s.llmBaseUrl.TrimEnd('/')
 $key = $s.llmApiKey
