@@ -41,3 +41,6 @@ src-tauri/sidecar/models/*
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright MCP 浏览器自动化产物（本地调试缓存，不入库）
+.playwright-mcp/
