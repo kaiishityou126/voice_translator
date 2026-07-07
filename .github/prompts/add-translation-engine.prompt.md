@@ -10,9 +10,9 @@ description: "引导式工作流:为 Voice Translator 添加一个新的翻译�
 ## 1. 后端分发 — [src-tauri/src/translate.rs](src-tauri/src/translate.rs)
 
 - 在 `translate()` 的 `match cfg.translation_engine.as_str()` 中加一个分支,指向新的 `translate_<engine>()` 函数。
-- 新函数签名参照现有 `translate_google` / `translate_deepl`:接收 `&reqwest::blocking::Client`、`&RuntimeConfig`、`&str`,返回 `anyhow::Result<String>`。
+- 新函数签名参照现有 `translate_google`:接收 `&reqwest::blocking::Client`、`&RuntimeConfig`、`&str`,返回 `anyhow::Result<String>`。
 - 错误用 `bail!("中文原因")`;空响应要报错;需要 key 的引擎先校验 key 非空。
-- 如需语言代码映射,仿照 `google_lang` / `deepl_lang` 加一个映射函数。
+- 如需语言代码映射,仿照 `google_lang` 加一个映射函数。
 
 ## 2. 配置字段 — [src-tauri/src/config.rs](src-tauri/src/config.rs)
 
@@ -36,4 +36,4 @@ description: "引导式工作流:为 Voice Translator 添加一个新的翻译�
 - 运行 `cd src-tauri; cargo check` 与 `npm run build` 两侧都通过。
 - 不破坏 `"none"`(纯字幕)分支——它在 pipeline 层跳过,不进 `translate()`。
 
-> 约定细节见 [AGENTS.md](AGENTS.md)、[.github/instructions/rust-backend.instructions.md](.github/instructions/rust-backend.instructions.md) 与 [.github/instructions/frontend.instructions.md](.github/instructions/frontend.instructions.md)。
+> 约定细节见 [AGENTS.md](AGENTS.md)。

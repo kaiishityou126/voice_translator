@@ -99,6 +99,19 @@
   color: var(--text);
 }
 
+/* 纯字幕(仅原文)无译文行 → 让最新一条的原文接管「主角」样式，与译文主角一致 */
+.subtitles.mode-origOnly .sub-card.live .orig {
+  font-size: calc(28px * var(--sub-scale));
+  font-weight: 600;
+  line-height: 1.36;
+  color: #14130c;
+  letter-spacing: -0.01em;
+  max-width: 100%;
+}
+[data-theme="dark"] .subtitles.mode-origOnly .sub-card.live .orig {
+  color: var(--text);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -365,7 +378,7 @@ body {
 .topbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 14px;
   row-gap: 8px;
   padding: 12px 22px;
@@ -413,6 +426,19 @@ body {
   color: #17160f;
   background: #fff;
   box-shadow: none;
+}
+
+/* 顶栏单行不折：两端（标题/下拉/图标组/开始按钮）固定不缩，中间语言区可收缩，
+   避免非回灌（系统音频/麦克风）目标语言按钮偏宽时把开始/停止按钮挤到第二行 */
+.topbar > .title,
+.topbar > .topmenu,
+.topbar .icon-group,
+.topbar .btn-icon {
+  flex-shrink: 0;
+}
+.topbar .seg-lang,
+.topbar .relay-langwrap {
+  min-width: 0;
 }
 
 .spacer {
@@ -1057,6 +1083,23 @@ body {
 [data-theme="dark"] .dir-tag.dir-out {
   color: #7cb9e8;
   background: rgba(124, 185, 232, 0.16);
+}
+
+/* 说话人分离标签：按说话人号取不同色相，与「我（同传）」并列显示 */
+.dir-tag.spk-tag {
+  margin-right: 6px;
+  color: hsl(var(--spk-h, 210) 70% 42%);
+  background: hsl(var(--spk-h, 210) 70% 42% / 0.12);
+}
+.dir-tag.spk-tag.spk-0 { --spk-h: 262; }
+.dir-tag.spk-tag.spk-1 { --spk-h: 158; }
+.dir-tag.spk-tag.spk-2 { --spk-h: 24; }
+.dir-tag.spk-tag.spk-3 { --spk-h: 330; }
+.dir-tag.spk-tag.spk-4 { --spk-h: 199; }
+.dir-tag.spk-tag.spk-5 { --spk-h: 96; }
+[data-theme="dark"] .dir-tag.spk-tag {
+  color: hsl(var(--spk-h, 210) 75% 72%);
+  background: hsl(var(--spk-h, 210) 75% 72% / 0.16);
 }
 
 .sub-card .orig {
@@ -1741,6 +1784,12 @@ body {
   background: transparent;
   box-shadow: none;
 }
+/* 高级/门控：说明紧贴其上方滑块——比默认 -10px 更拉近，吃掉 range 控件下方的视觉空隙；
+   仅收紧「滑块→说明」，不影响「滑块→滑块」的正常间距 */
+.vp-section .vp-slider + .info-line {
+  margin-top: -16px;
+  margin-bottom: 8px;
+}
 
 .field label {
   font-size: 12px;
@@ -1764,6 +1813,198 @@ body {
 .field select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(22, 145, 94, 0.12);
+}
+
+/* ===== LLM 模型库管理（下拉旁按钮 + 弹窗，用主题 token）===== */
+.llm-pick-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.llm-pick-head label {
+  margin-bottom: 0;
+}
+.llm-btn {
+  border: 1px solid var(--border-input);
+  background: var(--bg);
+  color: var(--text-2);
+  border-radius: 7px;
+  padding: 5px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s;
+}
+.llm-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.llm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.llm-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.llm-btn--primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  color: #fff;
+}
+
+.llm-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(18, 20, 18, 0.44);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  z-index: 300;
+}
+.llm-modal {
+  background: var(--bg);
+  border: 1px solid var(--border-input);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 560px;
+  max-height: 86vh;
+  overflow: auto;
+  padding: 16px 16px 14px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.3);
+}
+.llm-modal--narrow {
+  max-width: 420px;
+}
+.llm-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.llm-modal-head h3 {
+  margin: 0;
+  font-size: 14.5px;
+  color: var(--text-2);
+}
+.llm-modal-x {
+  border: none;
+  background: none;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--hint);
+}
+.llm-modal-x:hover {
+  color: var(--text-2);
+}
+.llm-lib-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.llm-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 11px;
+  border: 1px solid var(--border-input);
+  border-radius: 9px;
+  margin-bottom: 8px;
+}
+.llm-row-name {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.llm-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 20px;
+  color: var(--hint);
+  border: 1px solid var(--border-input);
+}
+.llm-row-sub {
+  font-size: 11px;
+  color: var(--hint);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.llm-caps {
+  display: flex;
+  gap: 12px;
+}
+.llm-cap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.llm-cap input {
+  accent-color: var(--accent);
+}
+.llm-ops {
+  display: flex;
+  gap: 4px;
+}
+.llm-icon-btn {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 3px 5px;
+  border-radius: 6px;
+}
+.llm-icon-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+.llm-empty {
+  font-size: 12px;
+  color: var(--hint);
+  text-align: center;
+  padding: 16px;
+  border: 1px dashed var(--border-input);
+  border-radius: 9px;
+}
+.llm-type-seg {
+  display: flex;
+  gap: 8px;
+}
+.llm-type-seg button {
+  flex: 1;
+  padding: 7px;
+  border: 1px solid var(--border-input);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.llm-type-seg button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.llm-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
 }
 
 .grid2 {

@@ -16,6 +16,7 @@ import {
   Volume2,
   Captions,
   Repeat,
+  Users,
   AlertTriangle,
 } from "lucide-react";
 import {
@@ -39,6 +40,8 @@ import {
   effectiveDisplayMode,
   loadSettings,
   saveSettings,
+  translationLlmProfile,
+  summaryLlmProfile,
 } from "./types";
 import { SubtitleView } from "./components/SubtitleView";
 import { RelayBar } from "./components/RelayBar";
@@ -312,6 +315,7 @@ function App() {
       if (
         showSettings &&
         !t.closest(".settings") &&
+        !t.closest(".llm-mask") &&
         !t.closest('[data-toggle="settings"]')
       ) {
         setShowSettings(false);
@@ -393,6 +397,10 @@ function App() {
         });
       });
     }
+    // 运行中切「说话人分离」：热推给入站流水线，不重启（仅后续段生效）
+    if (running && next.diarizationEnabled !== settings.diarizationEnabled) {
+      invoke("set_diarization", { enabled: next.diarizationEnabled }).catch(() => {});
+    }
     setSettings(next);
     saveSettings(next);
   };
@@ -400,13 +408,24 @@ function App() {
 
   async function start() {
     const eng = settings.translationEngine;
-    if (eng === "openai" && !settings.llmApiKey.trim()) {
-      setStatus({
-        state: "error",
-        detail: "OpenAI 接口需要 API Key（或改用 Google 免费 / 纯字幕）",
-      });
-      setShowSettings(true);
-      return;
+    if (eng === "llm") {
+      const p = translationLlmProfile(settings);
+      if (!p) {
+        setStatus({
+          state: "error",
+          detail: "未选择翻译模型，请在设置的「模型库管理」里添加并选择一个",
+        });
+        setShowSettings(true);
+        return;
+      }
+      if (!p.isLocal && !p.apiKey.trim()) {
+        setStatus({
+          state: "error",
+          detail: `翻译模型「${p.label}」需要 API Key（或改用 Google 免费 / 纯字幕）`,
+        });
+        setShowSettings(true);
+        return;
+      }
     }
     // 退出历史回看（若在），回到直播态
     setReview(null);
@@ -503,8 +522,8 @@ function App() {
     setStatus({ state: "idle" });
   }
 
-  const engineIsLLM =
-    settings.translationEngine === "openai" || settings.translationEngine === "ollama";
+  // 能否提炼重点：有可用的提炼模型即可（独立于翻译引擎，Google/纯字幕也能提炼）
+  const canSummarize = !!summaryLlmProfile(settings);
 
   // 在重点面板显示一条标红的错误/提示
   const showSummaryError = (msg: string) => {
@@ -530,8 +549,8 @@ function App() {
         showSummaryError("本次还没有可提炼的译文记录。");
         return;
       }
-      if (!engineIsLLM) {
-        showSummaryError("尚未配置 LLM 引擎（OpenAI / Ollama），无法提炼重点。");
+      if (!canSummarize) {
+        showSummaryError("尚未配置提炼模型，请在设置的「模型库管理」里添加一个 LLM 并选为提炼模型。");
         return;
       }
       setSummary("");
@@ -545,8 +564,8 @@ function App() {
 
   // 重新提炼：强制再次调 LLM 覆盖摘要文件
   async function resummarize() {
-    if (!engineIsLLM) {
-      showSummaryError("尚未配置 LLM 引擎（OpenAI / Ollama），无法提炼重点。");
+    if (!canSummarize) {
+      showSummaryError("尚未配置提炼模型，请在设置的「模型库管理」里添加一个 LLM 并选为提炼模型。");
       return;
     }
     setSummary("");
@@ -589,6 +608,7 @@ function App() {
         ts: g.ts,
         pending: false,
         direction: "in",
+        speaker: g.speaker,
       }));
       setReview({ stem: s.stem, items });
       setHistoryOpen(false);
@@ -819,6 +839,25 @@ function App() {
 
         <div className="icon-group">
           <button
+            className={`iconbtn${settings.diarizationEnabled && settings.asrEngine !== "qwen3Asr" ? " active" : ""}`}
+            disabled={settings.asrEngine === "qwen3Asr"}
+            onClick={() =>
+              update({ ...settings, diarizationEnabled: !settings.diarizationEnabled })
+            }
+            data-tip={
+              settings.asrEngine === "qwen3Asr"
+                ? "Qwen 模型不支持说话人分离"
+                : settings.diarizationEnabled
+                  ? "说话人分离：开（按说话人拆分字幕）"
+                  : "说话人分离：关"
+            }
+          >
+            <Users size={17} strokeWidth={1.8} />
+          </button>
+
+          <span className="icon-divider" aria-hidden="true" />
+
+          <button
             className={`iconbtn${overlayOn ? " active" : ""}`}
             onClick={toggleOverlay}
             data-tip={overlayOn ? "关闭悬浮窗" : "悬浮窗"}
@@ -953,7 +992,7 @@ function App() {
           error={summaryError}
           pending={summarizing}
           visible={summaryOpen}
-          canResummarize={engineIsLLM}
+          canResummarize={canSummarize}
           onResummarize={resummarize}
           onSave={saveSummary}
           onOpenDir={openSummaryDir}
@@ -1032,14 +1071,9 @@ function App() {
         <span className="chip">
           引擎 <span className="k">{TRANSLATION_ENGINE_LABEL[settings.translationEngine]}</span>
         </span>
-        {settings.translationEngine === "openai" && (
+        {settings.translationEngine === "llm" && translationLlmProfile(settings) && (
           <span className="chip">
-            模型 <span className="k">{settings.llmModel}</span>
-          </span>
-        )}
-        {settings.translationEngine === "ollama" && (
-          <span className="chip">
-            模型 <span className="k">{settings.ollamaModel}</span>
+            模型 <span className="k">{translationLlmProfile(settings)!.model}</span>
           </span>
         )}
         <span className="chip">

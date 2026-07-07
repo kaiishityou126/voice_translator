@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle } from "lucide-react";
 
@@ -7,6 +8,7 @@ import {
   SourceLang,
   AsrEngine,
   TranslationEngine,
+  LlmProfile,
   ThemeMode,
   SubtitleScale,
   SOURCE_LANG_LABEL,
@@ -14,6 +16,7 @@ import {
   TRANSLATION_ENGINE_LABEL,
   THEME_LABEL,
   SUBTITLE_SCALE_LABEL,
+  newLlmId,
 } from "../types";
 
 // Qwen3-ASR 官方支持的 30 种语言（另含 22 种中文方言）
@@ -144,16 +147,137 @@ function WarnIcon() {
   );
 }
 
+// LLM 模型新增/编辑弹窗（自带表单状态，保存时回传整条）
+function LlmEditModal({
+  initial,
+  exists,
+  onSave,
+  onCancel,
+}: {
+  initial: LlmProfile;
+  exists: boolean;
+  onSave: (p: LlmProfile) => void;
+  onCancel: () => void;
+}) {
+  const [p, setP] = useState<LlmProfile>(initial);
+  const upd = (patch: Partial<LlmProfile>) => setP((prev) => ({ ...prev, ...patch }));
+  const setLocal = (local: boolean) =>
+    setP((prev) => ({
+      ...prev,
+      isLocal: local,
+      baseUrl: prev.baseUrl || (local ? "http://localhost:11434/v1" : ""),
+    }));
+  return (
+    <div className="llm-mask" onClick={(e) => e.target === e.currentTarget && onCancel()}>
+      <div className="llm-modal llm-modal--narrow">
+        <div className="llm-modal-head">
+          <h3>{exists ? "编辑模型" : "新增模型"}</h3>
+          <button type="button" className="llm-modal-x" onClick={onCancel}>
+            ×
+          </button>
+        </div>
+        <div className="field">
+          <label>类型</label>
+          <div className="llm-type-seg">
+            <button type="button" className={!p.isLocal ? "on" : ""} onClick={() => setLocal(false)}>
+              云端（OpenAI 兼容）
+            </button>
+            <button type="button" className={p.isLocal ? "on" : ""} onClick={() => setLocal(true)}>
+              本地 Ollama
+            </button>
+          </div>
+        </div>
+        <div className="field">
+          <label>名称（自定义，含厂商也行）</label>
+          <input value={p.label} onChange={(e) => upd({ label: e.target.value })} placeholder="如：智谱 GLM-4-Flash" />
+        </div>
+        <div className="field">
+          <label>接口地址 Base URL</label>
+          <input value={p.baseUrl} onChange={(e) => upd({ baseUrl: e.target.value })} placeholder="https://open.bigmodel.cn/api/paas/v4" />
+        </div>
+        {!p.isLocal && (
+          <div className="field">
+            <label>API Key</label>
+            <input type="password" value={p.apiKey} onChange={(e) => upd({ apiKey: e.target.value })} placeholder="sk-..." />
+          </div>
+        )}
+        <div className="field">
+          <label>模型名 Model</label>
+          <input value={p.model} onChange={(e) => upd({ model: e.target.value })} placeholder="glm-4-flash" />
+        </div>
+        <div className="field">
+          <label>能力（决定它出现在哪个下拉）</label>
+          <div className="llm-caps">
+            <label className="llm-cap">
+              <input type="checkbox" checked={p.capTranslation} onChange={(e) => upd({ capTranslation: e.target.checked })} />
+              可用于翻译
+            </label>
+            <label className="llm-cap">
+              <input type="checkbox" checked={p.capSummary} onChange={(e) => upd({ capSummary: e.target.checked })} />
+              可用于提炼
+            </label>
+          </div>
+        </div>
+        <div className="llm-modal-foot">
+          <button type="button" className="llm-btn" onClick={onCancel}>
+            取消
+          </button>
+          <button type="button" className="llm-btn llm-btn--primary" onClick={() => onSave(p)}>
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsPanel({ value, disabled, onChange }: Props) {
   const set = (patch: Partial<Settings>) => onChange({ ...value, ...patch });
   const [showLangs, setShowLangs] = useState(false);
   const [showDisplay, setShowDisplay] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
   const [showVoiceprint, setShowVoiceprint] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   // 声纹登记状态：是否已登记 / 是否正在录音 / 提示文案
   const [enrolled, setEnrolled] = useState(false);
   const [enrolling, setEnrolling] = useState(false);
   const [enrollMsg, setEnrollMsg] = useState("");
+
+  // LLM 模型库弹窗 + 编辑弹窗（editProfile 非空 = 正在新增/编辑）
+  const [libOpen, setLibOpen] = useState(false);
+  const [editProfile, setEditProfile] = useState<LlmProfile | null>(null);
+
+  // 翻译引擎归一：旧的 openai/ollama 统一显示为 llm（下拉只有 llm/google/none）
+  const engineValue: TranslationEngine =
+    value.translationEngine === "google" || value.translationEngine === "none"
+      ? value.translationEngine
+      : "llm";
+  const transProfiles = value.llmProfiles.filter((p) => p.capTranslation);
+  const sumProfiles = value.llmProfiles.filter((p) => p.capSummary);
+  const profileLabel = (p: LlmProfile) =>
+    `${p.label || "未命名"}（${p.isLocal ? "Ollama" : "云端"}·${p.model || "?"}）`;
+
+  const upsertProfile = (p: LlmProfile) =>
+    set({
+      llmProfiles: value.llmProfiles.some((x) => x.id === p.id)
+        ? value.llmProfiles.map((x) => (x.id === p.id ? p : x))
+        : [...value.llmProfiles, p],
+    });
+  const deleteProfile = (id: string) =>
+    set({
+      llmProfiles: value.llmProfiles.filter((x) => x.id !== id),
+      translationLlmId: value.translationLlmId === id ? "" : value.translationLlmId,
+      summaryLlmId: value.summaryLlmId === id ? "" : value.summaryLlmId,
+    });
+  const toggleCap = (id: string, cap: "capTranslation" | "capSummary", on: boolean) =>
+    set({
+      llmProfiles: value.llmProfiles.map((x) => (x.id === id ? { ...x, [cap]: on } : x)),
+      // 取消能力时，若该模型正被指派为对应角色，一并清掉指派（避免“选中但不可用”的矛盾）
+      ...(!on && cap === "capTranslation" && value.translationLlmId === id
+        ? { translationLlmId: "" }
+        : {}),
+      ...(!on && cap === "capSummary" && value.summaryLlmId === id ? { summaryLlmId: "" } : {}),
+    });
 
   useEffect(() => {
     invoke<boolean>("voiceprint_exists").then(setEnrolled).catch(() => {});
@@ -274,90 +398,24 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
 
       <div className="field">
         <select
-          value={value.translationEngine}
+          value={engineValue}
           disabled={disabled}
-          onChange={(e) =>
-            set({ translationEngine: e.target.value as TranslationEngine })
-          }
+          onChange={(e) => set({ translationEngine: e.target.value as TranslationEngine })}
         >
-          {(
-            ["openai", "ollama", "google", "none"] as TranslationEngine[]
-          ).map((en) => (
-              <option key={en} value={en}>
-                {TRANSLATION_ENGINE_LABEL[en]}
-              </option>
-            )
-          )}
+          {(["llm", "google", "none"] as TranslationEngine[]).map((en) => (
+            <option key={en} value={en}>
+              {TRANSLATION_ENGINE_LABEL[en]}
+            </option>
+          ))}
         </select>
       </div>
 
-      {value.translationEngine === "openai" && (
-        <>
-          <div className="field">
-            <label>API 接口地址 Base URL</label>
-            <input
-              value={value.llmBaseUrl}
-              disabled={disabled}
-              onChange={(e) => set({ llmBaseUrl: e.target.value })}
-              placeholder="https://api.openai.com/v1"
-            />
-          </div>
-          <div className="grid2">
-            <div className="field">
-              <label>API Key</label>
-              <input
-                type="password"
-                value={value.llmApiKey}
-                disabled={disabled}
-                onChange={(e) => set({ llmApiKey: e.target.value })}
-                placeholder="sk-..."
-              />
-            </div>
-            <div className="field">
-              <label>模型名 Model</label>
-              <input
-                value={value.llmModel}
-                disabled={disabled}
-                onChange={(e) => set({ llmModel: e.target.value })}
-                placeholder="gpt-4o-mini"
-              />
-            </div>
-          </div>
-          <p className="hint">
-            兼容 OpenAI / DeepSeek / 通义千问 / Kimi 等任意 OpenAI 风格端点。质量最好，需 key。
-          </p>
-        </>
+      {engineValue === "llm" && (
+        <p className="hint">
+          云端或本地大模型，翻译质量最好、多语最稳。在下方选择/管理模型。
+        </p>
       )}
-
-      {value.translationEngine === "ollama" && (
-        <>
-          <div className="grid2">
-            <div className="field">
-              <label>Ollama 地址</label>
-              <input
-                value={value.ollamaBaseUrl}
-                disabled={disabled}
-                onChange={(e) => set({ ollamaBaseUrl: e.target.value })}
-                placeholder="http://localhost:11434/v1"
-              />
-            </div>
-            <div className="field">
-              <label>模型名</label>
-              <input
-                value={value.ollamaModel}
-                disabled={disabled}
-                onChange={(e) => set({ ollamaModel: e.target.value })}
-                placeholder="qwen2.5"
-              />
-            </div>
-          </div>
-          <p className="hint">
-            本地运行、免费、无需 key。需先装 Ollama 并拉模型（如 ollama pull qwen2.5）。中英日推荐 qwen 系列。
-          </p>
-        </>
-      )}
-
-      {value.translationEngine === "google" && (
+      {engineValue === "google" && (
         <p className="hint">
           免费、无需 key，中英日质量好。
           <br />
@@ -366,11 +424,167 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
           </span>
         </p>
       )}
-
-      {value.translationEngine === "none" && (
+      {engineValue === "none" && (
         <p className="hint">
           纯字幕模式：只显示<b>识别原文</b>、不做翻译。无需任何 key，可当离线字幕/转写工具用。
         </p>
+      )}
+
+      {engineValue === "llm" && (
+        <div className="field">
+          <div className="llm-pick-head">
+            <label>翻译用模型</label>
+            <button
+              type="button"
+              className="llm-btn"
+              disabled={disabled}
+              onClick={() => setLibOpen(true)}
+            >
+              ⚙ 模型库管理
+            </button>
+          </div>
+          <select
+            value={value.translationLlmId}
+            disabled={disabled}
+            onChange={(e) => set({ translationLlmId: e.target.value })}
+          >
+            {transProfiles.length === 0 ? (
+              <option value="">（库里没有「可翻译」的模型）</option>
+            ) : (
+              <>
+                {!transProfiles.some((p) => p.id === value.translationLlmId) && (
+                  <option value="">（未选择）</option>
+                )}
+                {transProfiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {profileLabel(p)}
+                  </option>
+                ))}
+              </>
+            )}
+          </select>
+          {transProfiles.length === 0 && (
+            <p className="hint hint--warn">
+              <WarnIcon />点「模型库管理」添加一个模型，并勾上「可用于翻译」。
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="field">
+        <div className="llm-pick-head">
+          <label>提炼重点用模型</label>
+          <button
+            type="button"
+            className="llm-btn"
+            disabled={disabled}
+            onClick={() => setLibOpen(true)}
+          >
+            ⚙ 模型库管理
+          </button>
+        </div>
+        <select
+          value={value.summaryLlmId}
+          disabled={disabled}
+          onChange={(e) => set({ summaryLlmId: e.target.value })}
+        >
+          <option value="">（未指定 → 默认用翻译模型）</option>
+          {sumProfiles.map((p) => (
+            <option key={p.id} value={p.id}>
+              {profileLabel(p)}
+            </option>
+          ))}
+        </select>
+        <p className="hint">
+          「✦ 提炼重点」用的模型，独立于翻译引擎（Google / 纯字幕也能提炼）；不指定就用翻译模型。
+        </p>
+      </div>
+
+      <div className="settings-divider">高级设置</div>
+
+      <CollapseHead
+        title="高级选项"
+        open={showAdvanced}
+        onToggle={() => setShowAdvanced((v) => !v)}
+      />
+      {showAdvanced && (
+      <div className="vp-section">
+      <div className="field vp-slider">
+        <label>分段最大时长 · SenseVoice {value.segMaxSecSensevoice.toFixed(0)}s</label>
+        <input
+          type="range"
+          min={3}
+          max={15}
+          step={1}
+          value={value.segMaxSecSensevoice}
+          disabled={disabled}
+          onChange={(e) => set({ segMaxSecSensevoice: Number(e.target.value) })}
+        />
+      </div>
+      <div className="field vp-slider">
+        <label>分段最大时长 · Qwen3 {value.segMaxSecQwen3.toFixed(0)}s</label>
+        <input
+          type="range"
+          min={4}
+          max={15}
+          step={1}
+          value={value.segMaxSecQwen3}
+          disabled={disabled}
+          onChange={(e) => set({ segMaxSecQwen3: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+连续说话超过此时长就<b>强制切一段</b>（只对当前所用引擎生效）。SenseVoice 是 CTC、长段易退化，默认短（6s）；Qwen3 需完整句子上下文，默认长（10s）。调短→出字更勤、延迟更低，但更容易切在句中；调长→句子更完整，但"攒一会一下子放"更明显。
+          </>
+        }
+      >
+        控制一段最长多久强制断句（影响延迟与完整度）
+      </InfoLine>
+      <div className="field vp-slider">
+        <label>断句停顿时长 {value.segSilenceMs}ms</label>
+        <input
+          type="range"
+          min={300}
+          max={1200}
+          step={50}
+          value={value.segSilenceMs}
+          disabled={disabled}
+          onChange={(e) => set({ segSilenceMs: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+连续静音达到此时长才算<b>一句说完</b>并切段。默认 500ms。调短→更快断句、更跟得上快语，但换气短停也可能被切、句子偏碎；调长→句子更完整、少切碎，但延迟更高、也更容易把多人的话并进一段。
+          </>
+        }
+      >
+        多长的停顿算"一句话说完"（影响断句灵敏度）
+      </InfoLine>
+      <div className="field vp-slider">
+        <label>说话人分离阈值 {value.diarizationThreshold.toFixed(2)}</label>
+        <input
+          type="range"
+          min={0.3}
+          max={0.9}
+          step={0.05}
+          value={value.diarizationThreshold}
+          disabled={disabled}
+          onChange={(e) => set({ diarizationThreshold: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+说话人分离的聚类阈值：<b>越大→分出的说话人越少</b>（抑制把同一人音色波动误判成新说话人），越小→越容易分出更多人。默认 0.70。分离开关在顶栏，此阈值改动在下次「开始」时生效。
+          </>
+        }
+      >
+        调节「说话人分离」把一段里几个人分开的松紧
+      </InfoLine>
+      </div>
       )}
 
       <div className="settings-divider">以下可在运行中修改</div>
@@ -543,7 +757,7 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       <InfoLine
         detail={
           <>
-            仅在<b>回灌·双向同传</b>时生效：出站每段先比对你登记的声纹，不像你的（旁人、两桌外的人）直接丢弃，不识别也不合成。需先<b>登记声音</b>并开启开关；登记要在同传<b>未启动</b>时进行。阈值越高越严，误挡自己就调低、漏进旁人就调高（默认 0.50）。
+在<b>回灌·双向同传</b>时生效：出站每段声音先与你登记的声纹做对比，不像你的（旁人、别人说话）直接丢弃，不识别也不合成。需先<b>登记声音</b>并开启开关；阈值越高越严，误挡自己就调低、漏进旁人就调高（默认 0.50）。
           </>
         }
       >
@@ -551,7 +765,104 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       </InfoLine>
       </div>
       )}
+
       </div>
+
+      {libOpen &&
+        createPortal(
+          <div className="llm-mask" onClick={(e) => e.target === e.currentTarget && setLibOpen(false)}>
+            <div className="llm-modal">
+              <div className="llm-modal-head">
+                <h3>LLM 模型库</h3>
+                <button type="button" className="llm-modal-x" onClick={() => setLibOpen(false)}>
+                  ×
+                </button>
+              </div>
+              <div className="llm-lib-toolbar">
+                <span className="hint">共 {value.llmProfiles.length} 个模型</span>
+                <button
+                  type="button"
+                  className="llm-btn llm-btn--primary"
+                  onClick={() =>
+                    setEditProfile({
+                      id: newLlmId(),
+                      label: "",
+                      isLocal: false,
+                      baseUrl: "",
+                      apiKey: "",
+                      model: "",
+                      capTranslation: true,
+                      capSummary: true,
+                    })
+                  }
+                >
+                  + 新增模型
+                </button>
+              </div>
+              <p className="hint" style={{ marginTop: 0 }}>
+                「可翻译 / 可提炼」是能力：勾了才会出现在对应下拉里，一个模型可两者都勾。
+              </p>
+              {value.llmProfiles.length === 0 ? (
+                <div className="llm-empty">还没有模型，点「+ 新增模型」添加。</div>
+              ) : (
+                value.llmProfiles.map((p) => (
+                  <div className="llm-row" key={p.id}>
+                    <div>
+                      <div className="llm-row-name">
+                        {p.label || "未命名"}
+                        <span className="llm-badge">{p.isLocal ? "Ollama" : "云端"}</span>
+                      </div>
+                      <div className="llm-row-sub">
+                        模型 {p.model || "—"} · {p.baseUrl}
+                      </div>
+                    </div>
+                    <div className="llm-caps">
+                      <label className="llm-cap">
+                        <input
+                          type="checkbox"
+                          checked={p.capTranslation}
+                          onChange={(e) => toggleCap(p.id, "capTranslation", e.target.checked)}
+                        />
+                        可翻译
+                      </label>
+                      <label className="llm-cap">
+                        <input
+                          type="checkbox"
+                          checked={p.capSummary}
+                          onChange={(e) => toggleCap(p.id, "capSummary", e.target.checked)}
+                        />
+                        可提炼
+                      </label>
+                    </div>
+                    <div className="llm-ops">
+                      <button type="button" className="llm-icon-btn" title="编辑" onClick={() => setEditProfile(p)}>
+                        ✏️
+                      </button>
+                      <button type="button" className="llm-icon-btn" title="删除" onClick={() => deleteProfile(p.id)}>
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {editProfile &&
+        createPortal(
+          <LlmEditModal
+            initial={editProfile}
+            exists={value.llmProfiles.some((x) => x.id === editProfile.id)}
+            onCancel={() => setEditProfile(null)}
+            onSave={(p) => {
+              upsertProfile(p);
+              setEditProfile(null);
+            }}
+          />,
+          document.body
+        )}
     </div>
   );
 }

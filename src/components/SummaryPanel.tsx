@@ -92,7 +92,7 @@ export function SummaryPanel({
                 data-tip={
                   canResummarize
                     ? "再次调用 LLM 重新提炼"
-                    : "重新提炼需 LLM 引擎（OpenAI / Ollama）"
+                    : "需先在设置的「模型库管理」里配置一个 LLM 并选为提炼模型"
                 }
                 data-tip-pos="end"
               >

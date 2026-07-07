@@ -2,7 +2,7 @@ name: Build & Package (Win/macOS/Linux)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feat/tts-relay ]
   pull_request:
     branches: [ main ]
 

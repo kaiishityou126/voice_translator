@@ -22,10 +22,27 @@ use tauri::{AppHandle, Emitter, Manager};
 pub trait Asr: Send + Sync {
     /// 识别一段 16k 单声道 f32 样本，返回去首尾空白后的文本（失败/空返回空串）。
     fn transcribe(&self, samples: &[f32]) -> String;
+    /// 识别并返回细节（文本 + 逐 token + 逐 token 起始秒），供说话人分离「按时间切文本」。
+    /// 默认只给文本、无时间戳（Qwen3 等不支持逐 token 时间戳的引擎）→ 上层降级为不拆分。
+    fn transcribe_detailed(&self, samples: &[f32]) -> AsrDetail {
+        AsrDetail {
+            text: self.transcribe(samples),
+            tokens: Vec::new(),
+            timestamps: None,
+        }
+    }
     /// 身份指纹（引擎 + 锁定的源语言）；与期望值不一致时上层重建识别器。
     fn fingerprint(&self) -> String;
     /// 新一轮流水线开始前调用：auto 模式据此重新检测语种（默认空实现，固定语种/Qwen3 无需）。
     fn reset_session(&self) {}
+}
+
+/// 识别细节：文本 + 逐 token 文本 + 逐 token 起始秒（tokens 与 timestamps 等长）。
+/// timestamps=None 表示该引擎不给时间戳（说话人分离无法切文本，退化为整段）。
+pub struct AsrDetail {
+    pub text: String,
+    pub tokens: Vec<String>,
+    pub timestamps: Option<Vec<f32>>,
 }
 
 /// 计算「引擎 + 源语言（+ auto 时的目标语言）」的期望指纹，供上层判断是否需重建识别器（无需先加载模型）。
@@ -344,13 +361,25 @@ impl SenseVoice {
 
 impl Asr for SenseVoice {
     fn transcribe(&self, samples: &[f32]) -> String {
+        self.transcribe_detailed(samples).text
+    }
+
+    fn transcribe_detailed(&self, samples: &[f32]) -> AsrDetail {
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(16_000, samples);
         self.recognizer.decode(&stream);
-        stream
-            .get_result()
-            .map(|r| r.text.trim().to_string())
-            .unwrap_or_default()
+        match stream.get_result() {
+            Some(r) => AsrDetail {
+                text: r.text.trim().to_string(),
+                tokens: r.tokens,
+                timestamps: r.timestamps,
+            },
+            None => AsrDetail {
+                text: String::new(),
+                tokens: Vec::new(),
+                timestamps: None,
+            },
+        }
     }
 
     fn fingerprint(&self) -> String {
@@ -417,18 +446,19 @@ impl AutoSenseVoice {
 
     /// 取/建该语种的固定识别器并跑识别；维护 LRU(用过的移到尾部，超量淘汰头部)。
     /// 现建一个识别器约 1~2s，仅该语种首次出现时发生。建失败则回退 auto。
-    fn transcribe_fixed(&self, lang: &str, samples: &[f32]) -> String {
+    /// 返回识别细节（含 token 时间戳），供说话人分离切文本。
+    fn transcribe_fixed_detailed(&self, lang: &str, samples: &[f32]) -> AsrDetail {
         let mut pool = self.pool.lock().unwrap();
         if let Some(idx) = pool.iter().position(|sv| sv.language == lang) {
             let sv = pool.remove(idx); // 取出
-            let out = sv.transcribe(samples);
+            let out = sv.transcribe_detailed(samples);
             pool.push(sv); // 回到尾部=最近使用
             return out;
         }
         // 池中没有：现建（沿用本 Auto 识别器的线程数）
         match SenseVoice::load(&self.app, lang, self.threads) {
             Ok(sv) => {
-                let out = sv.transcribe(samples);
+                let out = sv.transcribe_detailed(samples);
                 pool.push(sv);
                 if pool.len() > POOL_CAP {
                     pool.remove(0); // 淘汰最久未用(头部)
@@ -440,7 +470,7 @@ impl AutoSenseVoice {
             }
             Err(e) => {
                 eprintln!("[asr] 固定识别器加载失败({lang})，回退 auto: {e}");
-                self.auto.lock().unwrap().transcribe(samples)
+                self.auto.lock().unwrap().transcribe_detailed(samples)
             }
         }
     }
@@ -474,6 +504,10 @@ impl AutoSenseVoice {
 
 impl Asr for AutoSenseVoice {
     fn transcribe(&self, samples: &[f32]) -> String {
+        self.transcribe_detailed(samples).text
+    }
+
+    fn transcribe_detailed(&self, samples: &[f32]) -> AsrDetail {
         // 逐段判语种 → 路由（不锁定，整场可在中/日/英间切换）
         let mut lang = self.detect_lang(samples);
         // 判不出(短段/失败)：沿用上一段语种，避免短段乱跳；无上一段则保持 "auto" 兜底
@@ -488,15 +522,15 @@ impl Asr for AutoSenseVoice {
 
         // 路由：目标语言 或 判不出 → 常驻 auto；其余外语 → 固定识别器池
         let out = if lang == "auto" || lang == self.target {
-            self.auto.lock().unwrap().transcribe(samples)
+            self.auto.lock().unwrap().transcribe_detailed(samples)
         } else {
-            self.transcribe_fixed(&lang, samples)
+            self.transcribe_fixed_detailed(&lang, samples)
         };
         eprintln!(
             "[lid] route={} dur={:.2}s text=\"{}\"",
             lang,
             samples.len() as f32 / 16_000.0,
-            out
+            out.text
         );
         out
     }
@@ -549,13 +583,25 @@ impl Qwen3Asr {
 
 impl Asr for Qwen3Asr {
     fn transcribe(&self, samples: &[f32]) -> String {
+        self.transcribe_detailed(samples).text
+    }
+
+    fn transcribe_detailed(&self, samples: &[f32]) -> AsrDetail {
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(16_000, samples);
         self.recognizer.decode(&stream);
-        stream
-            .get_result()
-            .map(|r| r.text.trim().to_string())
-            .unwrap_or_default()
+        match stream.get_result() {
+            Some(r) => AsrDetail {
+                text: r.text.trim().to_string(),
+                tokens: r.tokens,
+                timestamps: r.timestamps,
+            },
+            None => AsrDetail {
+                text: String::new(),
+                tokens: Vec::new(),
+                timestamps: None,
+            },
+        }
     }
 
     fn fingerprint(&self) -> String {

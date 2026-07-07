@@ -12,14 +12,6 @@ fn default_translation_engine() -> String {
     "google".to_string()
 }
 
-fn default_ollama_base_url() -> String {
-    "http://localhost:11434/v1".to_string()
-}
-
-fn default_ollama_model() -> String {
-    "qwen2.5".to_string()
-}
-
 fn default_asr_engine() -> String {
     "senseVoice".to_string()
 }
@@ -38,6 +30,39 @@ fn default_relay_my_lang() -> String {
 
 fn default_voiceprint_threshold() -> f32 {
     0.5
+}
+
+fn default_diarization_threshold() -> f32 {
+    0.7
+}
+
+fn default_seg_silence_ms() -> u64 {
+    500
+}
+
+fn default_seg_max_sv() -> f32 {
+    6.0
+}
+
+fn default_seg_max_qwen3() -> f32 {
+    10.0
+}
+
+/// LLM 模型库中的一条（云端 OpenAI 兼容 或 本地 Ollama）。翻译与提炼按 id 从库里选用。
+/// 前端还带 label / capTranslation / capSummary 等「仅 UI」字段（显示名、下拉过滤用），后端 serde 自动忽略。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProfile {
+    pub id: String,
+    /// true = 本地 Ollama（无需 key）/ false = 云端（需 key）
+    #[serde(default)]
+    pub is_local: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 /// 前端 start_translation 传入的运行时配置。字段名与前端 camelCase 对齐。
@@ -62,19 +87,19 @@ pub struct RuntimeConfig {
     #[serde(default = "default_asr_engine")]
     pub asr_engine: String,
 
-    /// 翻译引擎："openai" / "ollama"(本地) / "google"(免费非官方) / "none"(纯字幕)
+    /// 翻译引擎："llm"（大模型，用 llm_profiles + translation_llm_id）/ "google"（免费非官方）/ "none"（纯字幕）
     #[serde(default = "default_translation_engine")]
     pub translation_engine: String,
 
-    // OpenAI 兼容接口
-    pub llm_base_url: String,
-    pub llm_api_key: String,
-    pub llm_model: String,
-    // Ollama（本地 OpenAI 兼容，无需 key）
-    #[serde(default = "default_ollama_base_url")]
-    pub ollama_base_url: String,
-    #[serde(default = "default_ollama_model")]
-    pub ollama_model: String,
+    /// LLM 模型库（云端 OpenAI 兼容 / 本地 Ollama 统一管理）；翻译与提炼按 id 选用。
+    #[serde(default)]
+    pub llm_profiles: Vec<LlmProfile>,
+    /// 翻译用模型 id（指向 llm_profiles 某条）；engine=="llm" 时生效。
+    #[serde(default)]
+    pub translation_llm_id: String,
+    /// 提炼重点用模型 id（指向 llm_profiles）；空则回退到翻译用模型。
+    #[serde(default)]
+    pub summary_llm_id: String,
 
     // VAD 可选调参（不传走默认）
     #[serde(default)]
@@ -120,6 +145,23 @@ pub struct RuntimeConfig {
     /// 声纹相似度阈值（余弦，∈[-1,1]）：段声纹与登记向量相似度 ≥ 此值才放行。默认 0.5。
     #[serde(default = "default_voiceprint_threshold")]
     pub voiceprint_threshold: f32,
+
+    /// 说话人分离（仅入站）：开启后把一段里不同说话人的话按 token 时间戳拆成多行并标注。实验性，默认关，可运行中热切。
+    #[serde(default)]
+    pub diarization_enabled: bool,
+    /// 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
+    #[serde(default = "default_diarization_threshold")]
+    pub diarization_threshold: f32,
+
+    /// 分段最大时长·SenseVoice（秒）：连续说话超此值强制切段。默认 6。
+    #[serde(default = "default_seg_max_sv")]
+    pub seg_max_sec_sensevoice: f32,
+    /// 分段最大时长·Qwen3（秒）：默认 10（需更长上下文）。
+    #[serde(default = "default_seg_max_qwen3")]
+    pub seg_max_sec_qwen3: f32,
+    /// 断句停顿时长（毫秒）：连续静音达此才断句切段。默认 500。
+    #[serde(default = "default_seg_silence_ms")]
+    pub seg_silence_ms: u64,
 }
 
 impl RuntimeConfig {

@@ -50,7 +50,8 @@
     },
     "resources": [
       "sidecar/models/silero_vad.onnx",
-      "sidecar/models/campplus_sv_zh_16k.onnx"
+      "sidecar/models/campplus_sv_zh_16k.onnx",
+      "sidecar/models/pyannote_segmentation_3.onnx"
     ],
     "icon": [
       "icons/32x32.png",

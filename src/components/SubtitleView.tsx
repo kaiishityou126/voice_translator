@@ -304,7 +304,7 @@ export function SubtitleView({
         </button>
       )}
 
-      <div className="subtitles" ref={containerRef} onScroll={onScroll}>
+      <div className={`subtitles mode-${displayMode}`} ref={containerRef} onScroll={onScroll}>
         <div className="subs-virt" style={{ height: virtualizer.getTotalSize() }}>
           {vItems.map((v) => {
             const it = rows[v.index];
@@ -325,6 +325,11 @@ export function SubtitleView({
                 >
                   {it.direction === "out" && (
                     <span className="dir-tag dir-out">我（同传）</span>
+                  )}
+                  {it.speaker != null && (
+                    <span className={`dir-tag spk-tag spk-${it.speaker % 6}`}>
+                      说话人{it.speaker + 1}
+                    </span>
                   )}
                   {showOrig && <div className="orig">{highlight(it.original, q)}</div>}
                   {showTrans &&

@@ -25,27 +25,20 @@ pub fn translate(
             on_chunk(&out);
             Ok(out)
         }
-        // Ollama 本身就是 OpenAI 兼容接口，复用 chat_translate，固定本地地址、无需 key
-        "ollama" => chat_translate(
-            client,
-            &cfg.ollama_base_url,
-            "",
-            &cfg.ollama_model,
-            cfg.target_lang_name(),
-            text,
-            context,
-            &mut on_chunk,
-        ),
-        _ => chat_translate(
-            client,
-            &cfg.llm_base_url,
-            &cfg.llm_api_key,
-            &cfg.llm_model,
-            cfg.target_lang_name(),
-            text,
-            context,
-            &mut on_chunk,
-        ),
+        // "llm"（云端 OpenAI 兼容 / 本地 Ollama 统一）：按 translation_llm_id 从模型库取端点
+        _ => {
+            let (base_url, api_key, model) = translate_endpoint(cfg)?;
+            chat_translate(
+                client,
+                base_url,
+                api_key,
+                model,
+                cfg.target_lang_name(),
+                text,
+                context,
+                &mut on_chunk,
+            )
+        }
     }
 }
 
@@ -217,7 +210,9 @@ fn glm_disable_thinking(body: &mut serde_json::Value, model: &str) {
     }
 }
 
-/// 通用：发起一次流式 chat completion，逐行解析 SSE 累积 content，每增量回调全量累计。
+/// 通用：发起一次流式 chat completion，逐行解析 SSE，遇 [DONE] 结束。
+/// 只显示/返回「正文」：正文里的 `<think>…</think>` 被剥掉;思考走独立的
+/// `reasoning_content` 字段时不显示，仅当正文全空才用它兜底（某些模型把答案塞进了 reasoning）。
 /// 翻译与摘要共用这套 SSE 解析。
 fn stream_chat(
     req: reqwest::blocking::RequestBuilder,
@@ -235,13 +230,15 @@ fn stream_chat(
             .unwrap_or("");
         bail!("LLM {} {}", status, msg);
     }
-    // 逐行读 SSE：每行 `data: {json}`，取 choices[0].delta.content 累加，遇 [DONE] 结束。
+    // 逐行读 SSE：每行 `data: {json}`，累计 delta.content（正文）与 delta.reasoning_content（思考）。
     let reader = BufReader::new(resp);
-    let mut acc = String::new();
+    let mut content = String::new(); // 正文累计（可能内联 <think>）
+    let mut reasoning = String::new(); // 思考链累计（不显示，正文全空时才兜底）
+    let mut shown = String::new(); // 上次推给前端的显示串，避免重复推
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
-            // 流中途断：不报错，用已累计的 acc 收尾（避免已显示的半句被当失败清掉）
+            // 流中途断：不报错，用已累计内容收尾（避免已显示的半句被当失败清掉）
             Err(_) => break,
         };
         let line = line.trim();
@@ -260,35 +257,73 @@ fn stream_chat(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-            if !delta.is_empty() {
-                acc.push_str(delta);
-                on_chunk(acc.trim());
+        let delta = &v["choices"][0]["delta"];
+        let mut grew = false;
+        if let Some(c) = delta["content"].as_str() {
+            if !c.is_empty() {
+                content.push_str(c);
+                grew = true;
             }
-        } else if let Some(rc) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
-            // 兜底：模型若没关掉思考、把正文塞进 reasoning_content，也累计起来免得整段空
+        }
+        if let Some(rc) = delta["reasoning_content"].as_str() {
             if !rc.is_empty() {
-                acc.push_str(rc);
-                on_chunk(acc.trim());
+                reasoning.push_str(rc);
+            }
+        }
+        if grew {
+            // 仅正文长了才刷新显示；<think> 未闭合时剥后为空，思考阶段自然不显示。
+            let disp = if content.contains('<') {
+                strip_think(&content)
+            } else {
+                content.clone()
+            };
+            let disp = disp.trim();
+            if !disp.is_empty() && disp != shown {
+                shown = disp.to_string();
+                on_chunk(disp);
             }
         }
     }
-    let out = acc.trim().to_string();
+    // 收尾：正文优先（剥掉 <think>）；正文空了才用 reasoning 兜底。
+    let mut out = strip_think(&content).trim().to_string();
+    if out.is_empty() {
+        out = reasoning.trim().to_string();
+    }
     if out.is_empty() {
         bail!("LLM 返回空内容");
     }
     Ok(out)
 }
 
-/// 选 LLM 端点：(base_url, api_key, model)。ollama 无需 key。
-fn llm_endpoint(cfg: &RuntimeConfig) -> (&str, &str, &str) {
-    match cfg.translation_engine.as_str() {
-        "ollama" => (cfg.ollama_base_url.as_str(), "", cfg.ollama_model.as_str()),
-        _ => (
-            cfg.llm_base_url.as_str(),
-            cfg.llm_api_key.as_str(),
-            cfg.llm_model.as_str(),
-        ),
+/// 按 id 在模型库找一条 → (base_url, api_key，本地 Ollama 无需 key 返回空串, model)。找不到 None。
+fn profile_endpoint<'a>(cfg: &'a RuntimeConfig, id: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    cfg.llm_profiles.iter().find(|p| p.id == id).map(|p| {
+        (
+            p.base_url.as_str(),
+            if p.is_local { "" } else { p.api_key.as_str() },
+            p.model.as_str(),
+        )
+    })
+}
+
+/// 翻译端点：按 translation_llm_id 取模型库里的一条；未选/失效则报错。
+fn translate_endpoint(cfg: &RuntimeConfig) -> Result<(&str, &str, &str)> {
+    match profile_endpoint(cfg, &cfg.translation_llm_id) {
+        Some(e) => Ok(e),
+        None => bail!("未选择翻译模型，请在设置的「模型库管理」里添加并选一个用于翻译"),
+    }
+}
+
+/// 提炼端点：优先 summary_llm_id；空/失效回退到翻译用模型；都没有则报错。
+fn summary_endpoint(cfg: &RuntimeConfig) -> Result<(&str, &str, &str)> {
+    if !cfg.summary_llm_id.is_empty() {
+        if let Some(e) = profile_endpoint(cfg, &cfg.summary_llm_id) {
+            return Ok(e);
+        }
+    }
+    match profile_endpoint(cfg, &cfg.translation_llm_id) {
+        Some(e) => Ok(e),
+        None => bail!("未选择提炼模型，请在设置里选择提炼模型或先配置翻译模型"),
     }
 }
 
@@ -393,7 +428,7 @@ fn summarize_structured(
     input_desc: &str,
     on_chunk: &mut impl FnMut(&str),
 ) -> Result<String> {
-    let (base_url, api_key, model) = llm_endpoint(cfg);
+    let (base_url, api_key, model) = summary_endpoint(cfg)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // 小节标题与「无」字样随目标语言本地化，保证整篇摘要（含结构骨架）都用目标语言
     let (lang_native, h_overview, h_points, h_decisions, h_actions, h_followup, none_word) =
@@ -515,7 +550,7 @@ fn summarize_map_chunk(
     chunk: &str,
     on_chunk: &mut dyn FnMut(&str),
 ) -> Result<String> {
-    let (base_url, api_key, model) = llm_endpoint(cfg);
+    let (base_url, api_key, model) = summary_endpoint(cfg)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let lang_native = target_lang_native(cfg);
     let system = format!(
@@ -563,6 +598,10 @@ fn strip_think(text: &str) -> String {
     // 未闭合：只剩 </think> 收尾，丢前面所有思考
     if let Some(b) = s.find("</think>") {
         s = s[b + "</think>".len()..].to_string();
+    }
+    // 未闭合的 <think>（流式中思考尚未结束，还没等到 </think>）→ 丢弃它及其后内容
+    if let Some(a) = s.find("<think>") {
+        s.truncate(a);
     }
     // 连续 3+ 星号收敛为 2 个
     let mut out = String::with_capacity(s.len());

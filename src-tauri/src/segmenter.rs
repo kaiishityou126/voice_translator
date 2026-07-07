@@ -14,9 +14,14 @@ const SAMPLE_RATE: usize = 16_000;
 /// - Qwen3-ASR：自回归 LLM 解码器，需完整句子上下文压低幻觉/模板泄漏，可接受延迟 → 长段。
 #[derive(Clone, Copy)]
 pub struct SegLimits {
-    pub silero_max_s: f32,  // Silero 原生分段：单段硬上限
-    pub energy_soft_s: f32, // 能量兜底：软上限（超后遇换气短停即收尾）
-    pub energy_hard_s: f32, // 能量兜底：硬上限（兜底强切）
+    /// Silero 原生分段：单段硬上限
+    pub silero_max_s: f32,
+    /// Silero 句末停顿阈值：静音达此才断句切段
+    pub silero_min_silence_s: f32,
+    /// 能量兜底：软上限（超后遇换气短停即收尾）
+    pub energy_soft_s: f32,
+    /// 能量兜底：硬上限（兜底强切）
+    pub energy_hard_s: f32,
 }
 
 impl SegLimits {
@@ -25,11 +30,13 @@ impl SegLimits {
         match asr_engine {
             "qwen3Asr" => Self {
                 silero_max_s: 10.0,
+                silero_min_silence_s: 0.5,
                 energy_soft_s: 6.0,
                 energy_hard_s: 10.0,
             },
             _ => Self {
                 silero_max_s: 6.0,
+                silero_min_silence_s: 0.5,
                 energy_soft_s: 4.0,
                 energy_hard_s: 7.0,
             },
@@ -95,6 +102,9 @@ pub struct SileroCore {
     ring_cap: usize,     // 环形缓冲容量（样本数）
     fed: u64,            // 已喂入 vad 的累计样本数，与 seg.start() 同基准
     pad: usize,          // 句首前补样本数
+    // 硬上限兼底：sherpa 的 max_speech_duration 对「连续无停顿说话」不强切，段会涨到十几秒。
+    open_samples: usize,     // 当前「连续语音」累计样本数（detected() 为真时累加，否则归零）
+    max_open_samples: usize, // 超此则 flush 强制收尾一段（= silero_max_s × 16k）
 }
 
 impl SileroCore {
@@ -103,9 +113,9 @@ impl SileroCore {
         config.silero_vad = sherpa_onnx::SileroVadModelConfig {
             model: Some(model.to_string_lossy().into_owned()),
             threshold,
-            // 句末停顿阈值：连续静音达 0.5s 才认为一句结束并切段。
-            // 换气类短停（<0.5s）被容忍，不会把一句话切碎或切在词中间。
-            min_silence_duration: 0.5,
+            // 句末停顿阈值：连续静音达此才认为一句结束并切段（高级可调，默认 0.5s）。
+            // 换气类短停被容忍，不会把一句话切碎或切在词中间。
+            min_silence_duration: limits.silero_min_silence_s,
             // 过滤短于 0.25s 的噪点，避免咖哒声起一段空段。
             min_speech_duration: 0.25,
             window_size: 512, // Silero v5 @16k 固定窗
@@ -130,6 +140,8 @@ impl SileroCore {
             ring_cap,
             fed: 0,
             pad,
+            open_samples: 0,
+            max_open_samples: (limits.silero_max_s * SAMPLE_RATE as f32) as usize,
         })
     }
 
@@ -142,6 +154,18 @@ impl SileroCore {
             self.ring.pop_front();
         }
         self.fed += samples.len() as u64;
+        // 硬上限兼底：自己数连续语音时长，超 silero_max_s 就 flush 强制切一段。
+        // 既将段长压回上限，又让输出按上限节奏出（缓解“攛一会一下子放”的爆发）。
+        // 自然有停顿的句子仍由 min_silence 在停顿处切，只有连续超时才被强切。
+        if self.vad.detected() {
+            self.open_samples += samples.len();
+            if self.open_samples >= self.max_open_samples {
+                self.vad.flush();
+                self.open_samples = 0;
+            }
+        } else {
+            self.open_samples = 0;
+        }
         self.drain(out);
     }
 

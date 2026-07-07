@@ -49,7 +49,7 @@ export function RelayBar({
     invoke<string>("get_platform").then(setPlatform).catch(() => {});
   }, []);
 
-  // 归位非法值：引擎/对方听变更后，你的语言、对方说、音色可能越界 → 拉回合法默认
+  // 归位非法值：引擎/对方听变更后，我的语言、对方说、音色可能越界 → 拉回合法默认
   useEffect(() => {
     const myOpts = relayMyLangOptions(settings.asrEngine);
     const speakOpts = relayPeerSpeakOptions(settings.asrEngine);
@@ -86,7 +86,7 @@ export function RelayBar({
 
   return (
     <>
-      {/* 两层语言块：你说→对方听 / 你读←对方说 */}
+      {/* 两层语言块：我说→对方听 / 我读←对方说 */}
       <div className="relay-langwrap" ref={wrapRef}>
         <button
           className={`relay-langblock${open ? " open" : ""}`}
@@ -112,11 +112,11 @@ export function RelayBar({
               回灌语言 <span className="relay-eng">识别 · {isQwen ? "Qwen3" : "SenseVoice"}</span>
             </p>
 
-            {/* 你的语言（你说 & 你读 共用，具体语种） */}
+            {/* 我的语言（我说 & 我读 共用，具体语种） */}
             <div className="relay-me">
               <div className="relay-me-lab">
-                <b>你的语言</b>
-                <i>你说 &amp; 你读 共用</i>
+                <b>我的语言</b>
+                <i>我说 &amp; 我读 共用</i>
               </div>
               <select
                 className="relay-pick"
@@ -132,10 +132,10 @@ export function RelayBar({
 
             <div className="relay-div" />
 
-            {/* 你说 → 对方听 */}
+            {/* 我说 → 对方听 */}
             <div className={`relay-dir${passthrough ? " dim" : ""}`}>
               <Mic size={14} strokeWidth={1.9} className="relay-dir-ico" />
-              <span>你说</span>
+              <span>我说</span>
               <b>{myShort}</b>
               <span className="ar">→</span>
               <span>对方听</span>
@@ -157,14 +157,14 @@ export function RelayBar({
             {!passthrough && settings.relayMyLang === settings.ttsTargetLang && (
               <p className="relay-warn">
                 <AlertTriangle size={12} strokeWidth={2} />
-                你的语言=对方听，等于没翻译——对方听到的是机器复述你的话（LLM 引擎下会改写措辞）。
+                我的语言=对方听，等于没翻译——对方听到的是机器复述我的话（LLM 引擎下会改写措辞）。
               </p>
             )}
 
-            {/* 你读 ← 对方说（入站识别源；Qwen3 锁自动） */}
+            {/* 我读 ← 对方说（入站识别源；Qwen3 锁自动） */}
             <div className="relay-dir">
               <Headphones size={14} strokeWidth={1.9} className="relay-dir-ico" />
-              <span>你读</span>
+              <span>我读</span>
               <b>{myShort}</b>
               <span className="ar">←</span>
               <span>对方说</span>
@@ -188,7 +188,7 @@ export function RelayBar({
               settings.relayInboundSourceLang === settings.relayMyLang && (
                 <p className="relay-warn">
                   <AlertTriangle size={12} strokeWidth={2} />
-                  「对方说」和你的语言相同，字幕等于没翻译（照搬原文）。
+                  「对方说」和我的语言相同，字幕等于没翻译（照搬原文）。
                 </p>
               )}
 

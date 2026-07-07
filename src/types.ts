@@ -6,8 +6,20 @@ export type TargetLang =
   | "hi" | "it" | "pt";
 // 源语言：auto = 让 SenseVoice 自动检测；其余为固定语种（短片段固定语种比 auto 准）
 export type SourceLang = "auto" | "zh" | "en" | "ja" | "ko" | "yue";
-// 翻译引擎：openai 兼容 / 本地 Ollama / Google 免费(非官方) / none=纯字幕不翻译
-export type TranslationEngine = "openai" | "ollama" | "google" | "none";
+// 翻译引擎：llm=大模型(用 llmProfiles+translationLlmId) / google 免费(非官方) / none=纯字幕不翻译
+export type TranslationEngine = "llm" | "google" | "none";
+
+// LLM 模型库中的一条（云端 OpenAI 兼容 或 本地 Ollama）。翻译与提炼按 id 从库里选用。
+export interface LlmProfile {
+  id: string;
+  label: string;
+  isLocal: boolean; // true=本地 Ollama（无需 key）/ false=云端
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  capTranslation: boolean; // 可用于翻译（下拉过滤）
+  capSummary: boolean; // 可用于提炼（下拉过滤）
+}
 // ASR 引擎：senseVoice = 快(CTC,默认) / qwen3Asr = 精准(LLM 解码,+延迟,需下载 ~940MB)
 export type AsrEngine = "senseVoice" | "qwen3Asr";
 // 界面主题：light=浅色 / dark=深色 / system=跟随系统
@@ -27,11 +39,10 @@ export interface Settings {
   asrEngine: AsrEngine;
   // 翻译
   translationEngine: TranslationEngine;
-  llmBaseUrl: string;
-  llmApiKey: string;
-  llmModel: string;
-  ollamaBaseUrl: string;
-  ollamaModel: string;
+  // LLM 模型库 + 角色指派（翻译用 / 提炼用）
+  llmProfiles: LlmProfile[];
+  translationLlmId: string;
+  summaryLlmId: string;
   // 译文文件保留天数（启动清理）与摘要文件保留天数（<=0 表示永久保留）
   transcriptKeepDays: number;
   summaryKeepDays: number;
@@ -61,6 +72,15 @@ export interface Settings {
   voiceprintGate: boolean;
   // 声纹相似度阈值（0~1，越高越严）：段声纹与登记声纹相似度 ≥ 此值才放行。
   voiceprintThreshold: number;
+  // 说话人分离（仅入站，实验性）：把一段里不同说话人的话按 token 时间戳拆成多行并标注。可运行中开关。
+  diarizationEnabled: boolean;
+  // 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
+  diarizationThreshold: number;
+  // 分段最大时长（秒），分引擎：SenseVoice 默认 6、Qwen3 默认 10。
+  segMaxSecSensevoice: number;
+  segMaxSecQwen3: number;
+  // 断句停顿时长（毫秒）：连续静音达此才断句切段。默认 500。
+  segSilenceMs: number;
 }
 
 // 主窗口 → 悬浮窗 下发的显示配置（悬浮窗是独立窗口、读不到 Settings，靠事件同步）
@@ -100,6 +120,8 @@ export interface SubtitleEvent {
   pending: boolean;
   // in=听对方(回灌文本字幕) / out=我说的话(合成给对方)
   direction: "in" | "out";
+  // 说话人分离得到的段内说话人号（省略/undefined=未分离）；前端渲染成「说话人N」标签。
+  speaker?: number | null;
 }
 
 // load_session 命令返回的历史段落（与 SubtitleEvent 同构，无 pending）
@@ -108,7 +130,7 @@ export interface Segment {
   ts: number;
   original: string;
   translated: string;
-  speaker: string | null;
+  speaker: number | null;
 }
 
 // list_sessions 命令返回的历史会话条目元信息
@@ -193,8 +215,7 @@ export const ASR_ENGINE_LABEL: Record<AsrEngine, string> = {
 };
 
 export const TRANSLATION_ENGINE_LABEL: Record<TranslationEngine, string> = {
-  openai: "OpenAI 兼容接口",
-  ollama: "Ollama 免费（本地·部署）",
+  llm: "LLM 大模型",
   google: "Google 免费（非官方）",
   none: "纯字幕（不翻译）",
 };
@@ -325,11 +346,9 @@ export const DEFAULT_SETTINGS: Settings = {
   asrEngine: "senseVoice",
   // 首次启动默认 Google 免费(非官方,无需 key),开箱即用;用户改过后走 localStorage 存档
   translationEngine: "google",
-  llmBaseUrl: "https://api.openai.com/v1",
-  llmApiKey: "",
-  llmModel: "gpt-4o-mini",
-  ollamaBaseUrl: "http://localhost:11434/v1",
-  ollamaModel: "qwen2.5",
+  llmProfiles: [],
+  translationLlmId: "",
+  summaryLlmId: "",
   transcriptKeepDays: 10,
   summaryKeepDays: 0,
   summaryMaxContext: 10000,
@@ -347,6 +366,11 @@ export const DEFAULT_SETTINGS: Settings = {
   ttsVoice: 41,
   voiceprintGate: false,
   voiceprintThreshold: 0.5,
+  diarizationEnabled: false,
+  diarizationThreshold: 0.7,
+  segMaxSecSensevoice: 6,
+  segMaxSecQwen3: 10,
+  segSilenceMs: 500,
 };
 
 import { invoke } from "@tauri-apps/api/core";
@@ -376,4 +400,20 @@ export async function loadSettings(): Promise<Settings> {
 export function saveSettings(s: Settings): void {
   // fire-and-forget:Rust 收到 IPC 后同步写盘,失败也不阻塞 UI
   invoke("save_settings", { json: JSON.stringify(s) }).catch(() => {});
+}
+// ===== LLM 模型库解析（翻译/提炼按 id 从库里取一条）=====
+export function findLlmProfile(s: Settings, id: string): LlmProfile | undefined {
+  return s.llmProfiles.find((p) => p.id === id);
+}
+// 翻译用模型（translationLlmId 指向的一条）
+export function translationLlmProfile(s: Settings): LlmProfile | undefined {
+  return findLlmProfile(s, s.translationLlmId);
+}
+// 提炼用模型：优先 summaryLlmId，空/失效回退翻译用模型
+export function summaryLlmProfile(s: Settings): LlmProfile | undefined {
+  return findLlmProfile(s, s.summaryLlmId) ?? translationLlmProfile(s);
+}
+// 生成一个模型库条目 id
+export function newLlmId(): string {
+  return "llm_" + Math.random().toString(36).slice(2, 9);
 }

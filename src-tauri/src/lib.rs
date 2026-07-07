@@ -2,6 +2,7 @@ mod asr;
 mod capture;
 mod config;
 mod denoise;
+mod diarize;
 mod pipeline;
 mod playback;
 mod segmenter;
@@ -181,6 +182,15 @@ fn stop_translation(app: AppHandle, state: State<AppState>) -> Result<(), String
 fn set_target_lang(state: State<AppState>, target_lang: String) {
     if let Some(h) = state.pipeline.lock().unwrap().as_ref() {
         h.set_target_lang(target_lang);
+    }
+}
+
+/// 运行中热切说话人分离开关：仅入站流水线感知，不重启、不打断采集/识别。
+/// 此后识别的段落按新开关处理；空闲(无流水线)时静默忽略（下次开始按配置生效）。
+#[tauri::command]
+fn set_diarization(state: State<AppState>, enabled: bool) {
+    if let Some(h) = state.pipeline.lock().unwrap().as_ref() {
+        h.set_diarization(enabled);
     }
 }
 
@@ -460,9 +470,10 @@ fn save_settings(app: AppHandle, json: String) -> Result<(), String> {
 /// emit("summary") 逐步回填，完成后写 <stem>.summary.<lang>.md。立即返回，结果走事件不阻塞 UI。
 #[tauri::command]
 fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String> {
-    let engine = config.translation_engine.as_str();
-    if engine != "openai" && engine != "ollama" {
-        return Err("重点提炼需 LLM 引擎（OpenAI 兼容 / Ollama）".to_string());
+    // 提炼独立于翻译引擎：只要有可用的提炼模型即可（summary_llm_id 优先，空则回退翻译模型）
+    let resolves = |id: &str| !id.is_empty() && config.llm_profiles.iter().any(|p| p.id == id);
+    if !resolves(&config.summary_llm_id) && !resolves(&config.translation_llm_id) {
+        return Err("未选择提炼模型，请在设置的「模型库管理」里配置并选一个".to_string());
     }
     let path = transcript::latest_transcript(&app).ok_or("没有可提炼的译文记录")?;
     let segs = transcript::read_session(&path).map_err(|e| e.to_string())?;
@@ -485,11 +496,25 @@ fn summarize_session(app: AppHandle, config: RuntimeConfig) -> Result<(), String
     }
     let summary_path = transcript::summary_path_for(&path, &config.target_lang);
     let app2 = app.clone();
+    // 记录实际使用的提炼模型（summary_llm_id 优先，空则回退翻译模型），日志直接给出模型名@baseUrl 便于追踪
+    let summary_prof = config
+        .llm_profiles
+        .iter()
+        .find(|p| p.id == config.summary_llm_id)
+        .or_else(|| {
+            config
+                .llm_profiles
+                .iter()
+                .find(|p| p.id == config.translation_llm_id)
+        });
+    let summary_desc = summary_prof
+        .map(|p| format!("{} {}@{}", p.id, p.model, p.base_url))
+        .unwrap_or_else(|| "<none>".to_string());
     debug_log(
         &app,
         &format!(
-            "summarize_session: start engine={} tgtLang={} chars={}",
-            engine,
+            "summarize_session: start summaryLlm={} tgtLang={} chars={}",
+            summary_desc,
             config.target_lang,
             content.chars().count()
         ),
@@ -648,6 +673,7 @@ pub fn run() {
             start_translation,
             stop_translation,
             set_target_lang,
+            set_diarization,
             set_relay_passthrough,
             toggle_overlay,
             model_exists,
