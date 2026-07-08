@@ -302,8 +302,9 @@ impl EnergyCore {
             if voiced {
                 self.in_speech = true;
                 self.silence_run = 0;
+                // preroll 末尾就是当前帧（上面刚 push 进去），drain 已含之，不能再单独追加当前帧，
+                // 否则段首这一帧被写两遍（起音处 20ms 重复波形，害首音节识别）。
                 self.cur.extend(self.preroll.drain(..));
-                self.cur.extend_from_slice(frame);
             }
         } else {
             self.cur.extend_from_slice(frame);

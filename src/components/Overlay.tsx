@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Play, Square, X, Minus, Plus, Check, Repeat, Volume2, Mic } from "lucide-react";
 import { SubtitleEvent, StatusEvent, OverlayConfig } from "../types";
 
@@ -39,29 +39,34 @@ export function Overlay() {
   const flashTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    const unsubs: Array<() => void> = [];
+    // 收集 Promise<UnlistenFn>；cleanup 里 Promise.then 解绑，避免同步 cleanup 时列表还空导致的泄漏/重复注册。
+    const subs: Array<Promise<UnlistenFn>> = [];
     // id 守卫：流式回填会乱序到达，丢弃比当前更旧段落的迟到帧，避免新句被旧句覆盖
-    listen<SubtitleEvent>("subtitle", (e) =>
-      setSub((prev) => (prev && e.payload.id < prev.id ? prev : e.payload))
-    ).then((u) => unsubs.push(u));
-    listen<StatusEvent>("status", (e) => {
-      const s = e.payload.state;
-      if (s === "idle" || s === "error") setRunning(false);
-      else setRunning(true); // starting/listening/recognizing/translating
-    }).then((u) => unsubs.push(u));
-    listen<OverlayConfig>("overlay-config", (e) => setCfg(e.payload)).then((u) =>
-      unsubs.push(u)
+    subs.push(
+      listen<SubtitleEvent>("subtitle", (e) =>
+        setSub((prev) => (prev && e.payload.id < prev.id ? prev : e.payload))
+      )
     );
+    subs.push(
+      listen<StatusEvent>("status", (e) => {
+        const s = e.payload.state;
+        if (s === "idle" || s === "error") setRunning(false);
+        else setRunning(true); // starting/listening/recognizing/translating
+      })
+    );
+    subs.push(listen<OverlayConfig>("overlay-config", (e) => setCfg(e.payload)));
     // 主窗口通知「悬浮窗刚被打开」→ 闪现全背景色+按钮约 1.2s，再淡回设定透明度
-    listen("overlay-shown", () => {
-      setFlash(true);
-      if (flashTimer.current) window.clearTimeout(flashTimer.current);
-      flashTimer.current = window.setTimeout(() => setFlash(false), 1200);
-    }).then((u) => unsubs.push(u));
+    subs.push(
+      listen("overlay-shown", () => {
+        setFlash(true);
+        if (flashTimer.current) window.clearTimeout(flashTimer.current);
+        flashTimer.current = window.setTimeout(() => setFlash(false), 1200);
+      })
+    );
     // 挂载后向主窗口要一次当前配置（首次打开时主窗口还没主动下发过）
     emit("overlay-ready").catch(() => {});
     return () => {
-      unsubs.forEach((u) => u());
+      subs.forEach((p) => p.then((u) => u()));
       if (flashTimer.current) window.clearTimeout(flashTimer.current);
     };
   }, []);

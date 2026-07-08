@@ -76,6 +76,8 @@ export interface Settings {
   diarizationEnabled: boolean;
   // 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
   diarizationThreshold: number;
+  // 全局说话人库跨段归并阈值（越大→归并越严、同一人易裂成多号；越小→归并越松）。默认 0.55。
+  speakerMergeThreshold: number;
   // 分段最大时长（秒），分引擎：SenseVoice 默认 6、Qwen3 默认 10。
   segMaxSecSensevoice: number;
   segMaxSecQwen3: number;
@@ -368,6 +370,7 @@ export const DEFAULT_SETTINGS: Settings = {
   voiceprintThreshold: 0.5,
   diarizationEnabled: false,
   diarizationThreshold: 0.7,
+  speakerMergeThreshold: 0.55,
   segMaxSecSensevoice: 6,
   segMaxSecQwen3: 10,
   segSilenceMs: 500,
@@ -383,18 +386,29 @@ export async function loadSettings(): Promise<Settings> {
   // 1) 优先读 Rust 端的 settings.json
   try {
     const raw = await invoke<string | null>("load_settings");
-    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    if (raw) return migrateSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(raw) });
   } catch {
     // 忽略,继续兜底
   }
   // 2) 旧版本数据迁移:文件没有则尝试读 localStorage(读到后下次保存会写入文件)
   try {
     const legacy = localStorage.getItem(STORAGE_KEY);
-    if (legacy) return { ...DEFAULT_SETTINGS, ...JSON.parse(legacy) };
+    if (legacy) return migrateSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(legacy) });
   } catch {
     // 忽略损坏的本地存储
   }
   return { ...DEFAULT_SETTINGS };
+}
+
+// 旧配置一次性归一化：早期 translationEngine 存 "openai"/"ollama"，现已统一成 "llm"
+// （云端 OpenAI 兼容 / 本地 Ollama 都走同一 LLM 路径，按 translationLlmId 从模型库取端点）。
+// 不迁移会导致 UI 下拉/footer 标签与存储值不一致；后端本就 _ => 兜底走 LLM，功能不受影响。
+function migrateSettings(s: Settings): Settings {
+  const eng = s.translationEngine as string;
+  if (eng === "openai" || eng === "ollama") {
+    return { ...s, translationEngine: "llm" };
+  }
+  return s;
 }
 
 export function saveSettings(s: Settings): void {

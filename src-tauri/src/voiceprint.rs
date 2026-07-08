@@ -86,10 +86,12 @@ fn vp_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir.join(VP_FILE))
 }
 
-/// 登记声纹落盘。
+/// 登记声纹落盘（原子写：先写 .part 再 rename，避免写一半崩溃损坏 voiceprint.json）。
 pub fn save(app: &AppHandle, embedding: &[f32]) -> Result<()> {
     let path = vp_path(app)?;
-    std::fs::write(path, serde_json::to_string(embedding)?)?;
+    let tmp = path.with_extension("json.part");
+    std::fs::write(&tmp, serde_json::to_string(embedding)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -133,15 +135,33 @@ impl Gate {
         }
     }
 
-    /// 判断该 16k 段是否是登记者。返回 (是否放行, 相似度)。
+    /// 判断该 16k 段是否是登记者。
     /// 提取不出声纹（段太短）时放行，不误杀——交给后续幻觉/套话熔断。
-    pub fn accepts(&self, seg_16k: &[f32]) -> (bool, f32) {
+    /// 登记向量与实测声纹维度不一致（模型换代/旧 voiceprint.json）时无法比对：
+    /// 返回 DimMismatch 让上层降级放行并提示重新登记，绝不静默把每段都判旁人丢掉。
+    pub fn accepts(&self, seg_16k: &[f32]) -> GateDecision {
         match self.extractor.embed(seg_16k) {
             Some(emb) => {
-                let score = cosine(&emb, &self.enrolled);
-                (score >= self.threshold, score)
+                if emb.len() != self.enrolled.len() {
+                    return GateDecision::DimMismatch;
+                }
+                if cosine(&emb, &self.enrolled) >= self.threshold {
+                    GateDecision::Accept
+                } else {
+                    GateDecision::Reject
+                }
             }
-            None => (true, 1.0),
+            None => GateDecision::Accept,
         }
     }
+}
+
+/// 出站声纹门控判定结果。
+pub enum GateDecision {
+    /// 放行：是登记者，或段太短无法判定（宁放勿杀）。
+    Accept,
+    /// 拒绝：声纹与登记者相似度低于阈值，判为旁人。
+    Reject,
+    /// 登记向量与实测声纹维度不一致（模型换代/旧登记文件）：无法比对，需降级放行 + 提示重新登记。
+    DimMismatch,
 }

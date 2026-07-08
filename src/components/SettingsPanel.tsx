@@ -584,6 +584,27 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       >
         调节「说话人分离」把一段里几个人分开的松紧
       </InfoLine>
+      <div className="field vp-slider">
+        <label>跨段归并阈值 {value.speakerMergeThreshold.toFixed(2)}</label>
+        <input
+          type="range"
+          min={0.3}
+          max={0.9}
+          step={0.05}
+          value={value.speakerMergeThreshold}
+          disabled={disabled}
+          onChange={(e) => set({ speakerMergeThreshold: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+控制全局说话人库把<b>跨段落</b>的同一个人归到同一编号的松紧：<b>越大→归并越严</b>（要求声纹更像才算同一人，长会议里同一人易裂成「说话人1/说话人3」），越小→归并越松（更容易把两个人并成同一号）。默认 0.55。此阈值改动在下次「开始」时生效。
+          </>
+        }
+      >
+        调节同一个人在不同段落是否归到同一编号
+      </InfoLine>
       </div>
       )}
 

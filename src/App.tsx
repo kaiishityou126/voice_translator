@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, emit } from "@tauri-apps/api/event";
+import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   PictureInPicture2,
@@ -230,71 +230,93 @@ function App() {
 
   // 订阅 Rust 端事件
   useEffect(() => {
-    const unsubs: Array<() => void> = [];
-    listen<SubtitleEvent>("subtitle", (e) => {
-      // 同 id 回填（原文→译文），否则追加
-      setSubtitles((prev) => {
-        const idx = prev.findIndex((s) => s.id === e.payload.id);
-        if (idx >= 0) {
-          const next = prev.slice();
-          next[idx] = e.payload;
-          return next;
-        }
-        // 整场留内存：去掉旧的 200 条上限，DOM 由 SubtitleView 虚拟滚动兜底
-        return [...prev, e.payload];
-      });
-    }).then((u) => unsubs.push(u));
-    listen<StatusEvent>("status", (e) => {
-      setStatus(e.payload);
-      const s = e.payload.state;
-      // 按方向记最近状态（direction 缺省当入站）；"all"（停止的权威 idle）两条都置。
-      // running 不在此直接置 —— 见下方按 dirState 推导的 effect（回灌时单条方向报错/停不误停另一条）。
-      const d = e.payload.direction;
-      setDirState((prev) =>
-        d === "all"
-          ? { in: s, out: s }
-          : d === "out"
-            ? { ...prev, out: s }
-            : { ...prev, in: s }
-      );
-    }).then((u) => unsubs.push(u));
-    listen<{ pct: number; downloaded: number; total: number }>("model-progress", (e) => {
-      // 识别模型进度：回填清单里的 ASR 项（asrSense/asrQwen 只会存在其一），保留 kind/label/status。
-      setDlList((prev) =>
-        prev &&
-        prev.map((it) =>
-          it.kind === "asrSense" || it.kind === "asrQwen" ? { ...it, ...e.payload } : it
-        )
-      );
-    }).then((u) => unsubs.push(u));
-    listen<{ pct: number; downloaded: number; total: number }>("tts-progress", (e) => {
-      // 合成模型进度：回填清单里的 tts 项。
-      setDlList((prev) => prev && prev.map((it) => (it.kind === "tts" ? { ...it, ...e.payload } : it)));
-    }).then((u) => unsubs.push(u));
-    listen<{ vad: string }>("engine-info", (e) => {
-      setVad(e.payload.vad);
-    }).then((u) => unsubs.push(u));
-    listen<{ lang: string }>("language-detected", (e) => {
-      setDetectedLang(e.payload.lang);
-    }).then((u) => unsubs.push(u));
-    listen<SummaryEvent>("summary", (e) => {
-      // 流式线程把「[提炼失败] ...」也当一条 summary 终帧发来（invoke 早已 Ok 返回，走不到 catch）；
-      // 命中失败标记时置 error 让面板走警告色，而非当普通正文黑字显示。
-      const text = e.payload.text;
-      setSummary(text);
-      setSummaryError(text.startsWith("[提炼失败]"));
-      setSummarizing(e.payload.pending);
-    }).then((u) => unsubs.push(u));
-    listen("overlay-start", () => startRef.current()).then((u) => unsubs.push(u));
+    // 收集每个 listen 的 Promise<UnlistenFn>；cleanup 里 Promise.all 后统一解绑，
+    // 避免旧写法「同步 cleanup 时 unsubs 还空 → 监听器泄漏、重复注册」的竞态。
+    const subs: Array<Promise<UnlistenFn>> = [];
+    subs.push(
+      listen<SubtitleEvent>("subtitle", (e) => {
+        // 同 id 回填（原文→译文），否则追加
+        setSubtitles((prev) => {
+          const idx = prev.findIndex((s) => s.id === e.payload.id);
+          if (idx >= 0) {
+            const next = prev.slice();
+            next[idx] = e.payload;
+            return next;
+          }
+          // 整场留内存：去掉旧的 200 条上限，DOM 由 SubtitleView 虚拟滚动兜底
+          return [...prev, e.payload];
+        });
+      })
+    );
+    subs.push(
+      listen<StatusEvent>("status", (e) => {
+        setStatus(e.payload);
+        const s = e.payload.state;
+        // 按方向记最近状态（direction 缺省当入站）；"all"（停止的权威 idle）两条都置。
+        // running 不在此直接置 —— 见下方按 dirState 推导的 effect（回灌时单条方向报错/停不误停另一条）。
+        const d = e.payload.direction;
+        setDirState((prev) =>
+          d === "all"
+            ? { in: s, out: s }
+            : d === "out"
+              ? { ...prev, out: s }
+              : { ...prev, in: s }
+        );
+      })
+    );
+    subs.push(
+      listen<{ pct: number; downloaded: number; total: number }>("model-progress", (e) => {
+        // 识别模型进度：回填清单里的 ASR 项（asrSense/asrQwen 只会存在其一），保留 kind/label/status。
+        setDlList((prev) =>
+          prev &&
+          prev.map((it) =>
+            it.kind === "asrSense" || it.kind === "asrQwen" ? { ...it, ...e.payload } : it
+          )
+        );
+      })
+    );
+    subs.push(
+      listen<{ pct: number; downloaded: number; total: number }>("tts-progress", (e) => {
+        // 合成模型进度：回填清单里的 tts 项。
+        setDlList((prev) => prev && prev.map((it) => (it.kind === "tts" ? { ...it, ...e.payload } : it)));
+      })
+    );
+    subs.push(
+      listen<{ vad: string }>("engine-info", (e) => {
+        setVad(e.payload.vad);
+      })
+    );
+    subs.push(
+      listen<{ lang: string }>("language-detected", (e) => {
+        setDetectedLang(e.payload.lang);
+      })
+    );
+    subs.push(
+      listen<SummaryEvent>("summary", (e) => {
+        // 流式线程把「[提炼失败] ...」也当一条 summary 终帧发来（invoke 早已 Ok 返回，走不到 catch）；
+        // 命中失败标记时置 error 让面板走警告色，而非当普通正文黑字显示。
+        const text = e.payload.text;
+        setSummary(text);
+        setSummaryError(text.startsWith("[提炼失败]"));
+        setSummarizing(e.payload.pending);
+      })
+    );
+    subs.push(listen("overlay-start", () => startRef.current()));
     // 悬浮窗挂载后请求一次当前显示配置(它启动时拿不到主窗最新设置)
-    listen("overlay-ready", () => {
-      emit("overlay-config", pickOverlayConfig(settingsRef.current)).catch(() => {});
-    }).then((u) => unsubs.push(u));
+    subs.push(
+      listen("overlay-ready", () => {
+        emit("overlay-config", pickOverlayConfig(settingsRef.current)).catch(() => {});
+      })
+    );
     // 悬浮窗上的字号/透明度控件改动 → 回写主窗口设置并落盘(单一数据源仍在主窗口)
-    listen<Partial<Settings>>("overlay-config-change", (e) => {
-      updateRef.current({ ...settingsRef.current, ...e.payload });
-    }).then((u) => unsubs.push(u));
-    return () => unsubs.forEach((u) => u());
+    subs.push(
+      listen<Partial<Settings>>("overlay-config-change", (e) => {
+        updateRef.current({ ...settingsRef.current, ...e.payload });
+      })
+    );
+    return () => {
+      subs.forEach((p) => p.then((u) => u()));
+    };
   }, []);
 
   // running 由两方向状态推导：任一方向活跃(listening/recognizing/translating)即运行中；

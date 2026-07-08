@@ -731,8 +731,13 @@ pub fn run() {
                         if let Some(h) = state.pipeline.lock().unwrap().take() {
                             h.stop();
                         }
+                        // 出站(回灌)流水线同样停干净，对称释放
+                        if let Some(h) = state.pipeline_out.lock().unwrap().take() {
+                            h.stop();
+                        }
                         // 释放进程内识别器（无子进程，drop 仅回收模型内存）
                         drop(state.recognizer.lock().unwrap().take());
+                        drop(state.recognizer_out.lock().unwrap().take());
                     }
                     app.exit(0);
                 }

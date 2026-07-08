@@ -44,8 +44,10 @@ pub fn translate(
 
 // ---------------- OpenAI 兼容（OpenAI / Ollama 共用、流式 SSE） ----------------
 /// 兜底重译：仅 LLM 路径（openai 兼容 / ollama）经过这里，Google / none 不走。
-/// 先正常带上下文翻一次；若 whatlang 判定「译文与原文同一语种」（模型很可能没翻、原样吐回），
-/// 清空多轮上下文重译一次——历史里混入的未翻译译文会诱导模型继续不翻，清空可切断这种传染。
+/// 第一次就带上下文流式翻译并逐字推前端（低延迟）；翻完再事后补判「疑似没翻译」（whatlang 同语种，
+/// 或译文残留源语言脚本），命中则清空多轮上下文重译一次，按同一 id 覆盖刚显示的内容——
+/// 历史里混入的未翻译译文会诱导模型继续不翻，清空可切断这种传染。
+/// 取舍：仅在罕见的 passthrough 坏情况下短暂闪现未翻文字，换取正常路径全程流式。
 fn chat_translate(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -56,14 +58,10 @@ fn chat_translate(
     context: &[(String, String)],
     on_chunk: &mut dyn FnMut(&str),
 ) -> Result<String> {
-    // 第一次先憋住不推前端（sink 吞掉流式增量），等整句翻完再判定语种：
-    // 这样若判定「没翻译/原样吐回」，这段未翻译内容既不显示也不会被上层写库，直接重译。
-    let out = {
-        let mut sink = |_: &str| {};
-        chat_once(
-            client, base_url, api_key, model, target_name, text, context, &mut sink,
-        )?
-    };
+    // 第一次就把流式增量推前端（逐字显示、低延迟；原文已在 ASR 阶段即时显示）。
+    let out = chat_once(
+        client, base_url, api_key, model, target_name, text, context, on_chunk,
+    )?;
     if (same_language(text, &out) && !is_target_lang(text, target_name))
         || output_wrong_script(&out, target_name)
     {
@@ -74,13 +72,11 @@ fn chat_translate(
             "whatlang 同语种"
         };
         eprintln!("[tr] 疑似未翻译({reason})，清空上下文重译  src=\"{text}\"  out1=\"{out}\"");
-        // 清空多轮上下文重译，这次才把增量推给前端显示。
+        // 清空多轮上下文重译，同样流式推前端，按同一 id 覆盖掉上面已显示的疑似未翻内容。
         return chat_once(
             client, base_url, api_key, model, target_name, text, &[], on_chunk,
         );
     }
-    // 正常译文：整句一次性推前端（已无逐字流式，原文在 ASR 阶段已即时显示）。
-    on_chunk(&out);
     Ok(out)
 }
 

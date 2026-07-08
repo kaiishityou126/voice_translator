@@ -17,7 +17,7 @@ fn default_asr_engine() -> String {
 }
 
 fn default_summary_max_context() -> usize {
-    48_000
+    10_000
 }
 
 fn default_tts_target_lang() -> String {
@@ -34,6 +34,10 @@ fn default_voiceprint_threshold() -> f32 {
 
 fn default_diarization_threshold() -> f32 {
     0.7
+}
+
+fn default_speaker_merge_threshold() -> f32 {
+    0.55
 }
 
 fn default_seg_silence_ms() -> u64 {
@@ -152,6 +156,10 @@ pub struct RuntimeConfig {
     /// 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
     #[serde(default = "default_diarization_threshold")]
     pub diarization_threshold: f32,
+    /// 全局说话人库跨段归并阈值（余弦）：段声纹与某说话人质心相似度 ≥ 此值即归为同一人。
+    /// 越大→归并越严（同一人易裂成多号），越小→归并越松（易把两人归成一号）。默认 0.55。
+    #[serde(default = "default_speaker_merge_threshold")]
+    pub speaker_merge_threshold: f32,
 
     /// 分段最大时长·SenseVoice（秒）：连续说话超此值强制切段。默认 6。
     #[serde(default = "default_seg_max_sv")]

@@ -238,6 +238,10 @@ pub struct SpeakerRegistry {
     centroids: Vec<(Vec<f32>, u32)>,
 }
 
+/// 质心均值权重上限：并入段数超过此值后不再增长权重，新样本恒占 1/(cap+1)（等效 EMA）。
+/// 目的：早期误并（旁人/噪声）的污染会被后续样本逐步冲淡纠正，而非无遗忘累计均值那样永久残留、cnt 越大越难纠偏。
+const CENTROID_MAX_CNT: f32 = 20.0;
+
 impl SpeakerRegistry {
     pub fn new() -> Self {
         Self {
@@ -246,7 +250,7 @@ impl SpeakerRegistry {
     }
 
     /// 把一个声纹向量归到全局说话人，返回其编号。
-    /// 与各质心求余弦，最大者若 ≥ threshold 则归入并按段数增量平均更新质心；否则新建。
+    /// 与各质心求余弦，最大者若 ≥ threshold 则归入并按「带上限均值」精炼质心；否则新建。
     pub fn assign(&mut self, emb: &[f32], threshold: f32) -> i32 {
         let mut best = -1i32;
         let mut best_score = threshold; // 必须 ≥ 阈值才算命中
@@ -259,7 +263,8 @@ impl SpeakerRegistry {
         }
         if best >= 0 {
             let (c, cnt) = &mut self.centroids[best as usize];
-            let n = *cnt as f32;
+            // 权重封顶：n 到 CENTROID_MAX_CNT 即止，新样本恒占 1/(cap+1) 权重（EMA），老误并可被冲淡。
+            let n = (*cnt as f32).min(CENTROID_MAX_CNT);
             let m = c.len().min(emb.len());
             for k in 0..m {
                 c[k] = (c[k] * n + emb[k]) / (n + 1.0);

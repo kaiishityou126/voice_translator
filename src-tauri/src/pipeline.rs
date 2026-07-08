@@ -158,6 +158,8 @@ pub fn start(
         // 队列元素带"入队时刻"，供消费端按等待时长自适应语速
         let (tx, rx) = mpsc::sync_channel::<(String, Instant)>(8);
         let stop_tts = stop.clone();
+        let app_tts = app.clone();
+        let dir_tts = dir.clone();
         // 空 output_device 时自动找 CABLE Input，找不到用默认输出
         let device = if cfg.output_device.is_empty() {
             crate::playback::find_cable_input().unwrap_or_default()
@@ -198,7 +200,16 @@ pub fn start(
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         let pcm = synth.synth(&text, sid, speed);
                         eprintln!("[tts] ←synth 样本={}", pcm.len());
-                        player.play(&pcm);
+                        if let Err(e) = player.play(&pcm) {
+                            emit_status(
+                                &app_tts,
+                                &stop_tts,
+                                &dir_tts,
+                                "error",
+                                Some(format!("回灸播放失败（输出设备可能已拔/切换）: {:#}", e)),
+                            );
+                            break;
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -260,6 +271,8 @@ pub fn start(
     // 说话人分离（仅入站）：开关热切读它；阈值启动时定；Diarizer 首次开启时在识别线程内惰性加载。
     let diar_flag = diar_enabled.clone();
     let diar_threshold = cfg.diarization_threshold;
+    // 全局说话人库跨段归并阈值（可调）：段声纹与说话人质心相似度 ≥ 此值即归为同一人。
+    let spk_match = cfg.speaker_merge_threshold;
     // 引擎名（判是否支持分离：Qwen3 无 token 时间戳，排除）
     let asr_engine_name = cfg.asr_engine.clone();
     thread::spawn(move || {
@@ -275,8 +288,6 @@ pub fn start(
         let mut spk_extractor: Option<crate::voiceprint::Extractor> = None;
         let mut spk_tried = false;
         let mut spk_registry = crate::diarize::SpeakerRegistry::new();
-        // 声纹余弦匹配阈值：段声纹与某全局说话人质心相似度 ≥ 此值即判为同一人。
-        const SPK_MATCH: f32 = 0.55;
 
         // 发一条字幕原文（translated 空，pending 由调用方定，可带说话人号）
         let emit_orig = |id: u64, original: String, speaker: Option<i32>, pending: bool| {
@@ -327,6 +338,9 @@ pub fn start(
             }
         };
 
+        // 声纹维度失配只告警一次（模型换代/旧 voiceprint.json）：避免每段刷屏。
+        let mut vp_dim_warned = false;
+
         loop {
             if stop_asr.load(Ordering::Relaxed) {
                 break;
@@ -346,9 +360,22 @@ pub fn start(
                         // 声纹门：过了音量粗筛再比对登记声纹，非本人（旁人）直接丢。
                         // 未登记/未开启时 gate 为 None，自动降级只保留 RMS 门。
                         if let Some(g) = &gate {
-                            let (ok, _score) = g.accepts(&seg);
-                            if !ok {
-                                continue;
+                            match g.accepts(&seg) {
+                                crate::voiceprint::GateDecision::Accept => {}
+                                crate::voiceprint::GateDecision::Reject => continue,
+                                crate::voiceprint::GateDecision::DimMismatch => {
+                                    // 登记声纹维度与当前模型不符：无法比对，降级放行（宁放勿全拦），仅提示一次重新登记。
+                                    if !vp_dim_warned {
+                                        vp_dim_warned = true;
+                                        emit_status(
+                                            &app_asr,
+                                            &stop_asr,
+                                            &dir_asr,
+                                            "error",
+                                            Some("声纹维度与当前模型不匹配，出站门控已降级放行，请重新登记声纹".to_string()),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -441,9 +468,9 @@ pub fn start(
                                 let emb = ex.embed(&seg_ref[a..b])?;
                                 if b - a < MIN_EMB {
                                     // 短段：只往已知说话人挂，挂不上标未知，不新建虚假编号
-                                    spk_registry.match_only(&emb, SPK_MATCH)
+                                    spk_registry.match_only(&emb, spk_match)
                                 } else {
-                                    Some(spk_registry.assign(&emb, SPK_MATCH))
+                                    Some(spk_registry.assign(&emb, spk_match))
                                 }
                             };
                             // 段内多人才逐行归属；否则整段一个人
@@ -572,8 +599,8 @@ pub fn start(
                                 .collect()
                         };
                         // 译文回调：把「截至目前的全量累计译文」按同一 id 回填（pending=true），前端整条替换。
-                        // 注：当前 LLM 路径为整句翻完一次性回填（translate.rs 先憋住判定语种再决定是否重译），
-                        // Google 本就无流式 → 实际多为整句到达；此处保留节流 ~100ms 仅防极端事件风暴。
+                        // LLM 路径逐字流式（translate.rs 首译即流式，疑似未翻才事后清上下文重译并覆盖）；
+                        // Google 无流式 → 整句一次到达。此处节流 ~100ms 防事件风暴。
                         let mut last_emit: Option<std::time::Instant> = None;
                         let on_chunk = |acc: &str| {
                             let due = last_emit
@@ -701,7 +728,18 @@ pub fn start_passthrough(app: AppHandle, cfg: RuntimeConfig) -> PipelineHandle {
                 break;
             }
             match frame_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(mono48) => player.play_48k(&mono48),
+                Ok(mono48) => {
+                    if let Err(e) = player.play_48k(&mono48) {
+                        emit_status(
+                            &app_play,
+                            &stop_play,
+                            "out",
+                            "error",
+                            Some(format!("回灸播放失败（输出设备可能已拔/切换）: {:#}", e)),
+                        );
+                        break;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }

@@ -63,9 +63,22 @@ impl SessionWriter {
             translated: translated.to_string(),
             speaker,
         };
-        if let Ok(line) = serde_json::to_string(&seg) {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
-                let _ = writeln!(f, "{}", line);
+        // 存档是核心持久化：磁盘满/权限/路径失效时不再静默吞错，至少打日志（否则译好的段无声丢失，比报错更糟）。
+        let line = match serde_json::to_string(&seg) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[transcript] 段序列化失败，丢弃 id={id}: {e}");
+                return;
+            }
+        };
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{}", line) {
+                    eprintln!("[transcript] 写入存档失败 {}（id={id}）: {e}", self.path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("[transcript] 打开存档失败 {}（id={id}）: {e}", self.path.display());
             }
         }
     }

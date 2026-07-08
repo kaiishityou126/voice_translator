@@ -49,8 +49,12 @@ impl Player {
     pub fn open(_device: &str) -> anyhow::Result<Self> {
         anyhow::bail!("当前平台未实现 TTS 回灌播放")
     }
-    pub fn play(&mut self, _samples24k: &[f32]) {}
-    pub fn play_48k(&mut self, _mono48: &[f32]) {}
+    pub fn play(&mut self, _samples24k: &[f32]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    pub fn play_48k(&mut self, _mono48: &[f32]) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -58,7 +62,7 @@ mod platform {
     use super::KOKORO_RATE;
     use std::collections::VecDeque;
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use wasapi::*;
 
     const DEVICE_RATE: usize = 48_000;
@@ -94,7 +98,6 @@ mod platform {
         audio_client: AudioClient,
         render: AudioRenderClient,
         h_event: Handle,
-        buffer_frames: usize,
         // 24k→48k 线性重采样状态
         prev: f32,
         pos: f64,
@@ -122,13 +125,11 @@ mod platform {
             audio_client.initialize_client(&format, &Direction::Render, &mode)?;
             let h_event = audio_client.set_get_eventhandle()?;
             let render = audio_client.get_audiorenderclient()?;
-            let buffer_frames = audio_client.get_buffer_size()? as usize;
             audio_client.start_stream()?;
             Ok(Self {
                 audio_client,
                 render,
                 h_event,
-                buffer_frames,
                 prev: 0.0,
                 pos: 0.0,
                 primed: false,
@@ -136,9 +137,10 @@ mod platform {
         }
 
         /// 阻塞播放一整段 24k 单声道（TTS）：24k→48k 升采样后写设备（调用方串行 → 不重叠）。
-        pub fn play(&mut self, samples24k: &[f32]) {
+        /// 设备失效时返回 Err，调用方据此停播上报。
+        pub fn play(&mut self, samples24k: &[f32]) -> Result<()> {
             if samples24k.is_empty() {
-                return;
+                return Ok(());
             }
             // 重采样到 48k 单声道
             let mut mono48: Vec<f32> = Vec::with_capacity(samples24k.len() * 2 + 4);
@@ -155,18 +157,22 @@ mod platform {
                 self.pos -= 1.0;
                 self.prev = cur;
             }
-            self.write_mono48(&mono48);
+            self.write_mono48(&mono48)
         }
 
         /// 播放一段已是 48k 单声道的 PCM（原声直通）：不重采样，直接单声道→双声道写设备。
-        pub fn play_48k(&mut self, mono48: &[f32]) {
-            if !mono48.is_empty() {
-                self.write_mono48(mono48);
+        pub fn play_48k(&mut self, mono48: &[f32]) -> Result<()> {
+            if mono48.is_empty() {
+                return Ok(());
             }
+            self.write_mono48(mono48)
         }
 
         /// 单声道 48k → 双声道交错 → 阻塞写满设备缓冲。
-        fn write_mono48(&mut self, mono48: &[f32]) {
+        /// 设备失效（会议软件热切输出设备等）时 GetCurrentPadding / 写入会返回 AUDCLNT_E_DEVICE_INVALIDATED：
+        /// 视为致命并返回 Err。旧实现里 get_available_space 失败回退成非 0 帧数 → want>0 → 写又失败，
+        /// 每 200ms 永久反复自旋、播放线程卡死；这里改为直接上抛让调用方停播重开。
+        fn write_mono48(&mut self, mono48: &[f32]) -> Result<()> {
             let mut bytes: VecDeque<u8> = VecDeque::with_capacity(mono48.len() * 8);
             for &s in mono48 {
                 let b = s.to_le_bytes();
@@ -177,13 +183,18 @@ mod platform {
                 let space = self
                     .audio_client
                     .get_available_space_in_frames()
-                    .unwrap_or(self.buffer_frames as u32) as usize;
+                    .context("查询输出设备可用缓冲失败（设备可能已失效）")?
+                    as usize;
                 let want = (bytes.len() / 8).min(space);
                 if want > 0 {
-                    let _ = self.render.write_to_device_from_deque(want, &mut bytes, None);
+                    self.render
+                        .write_to_device_from_deque(want, &mut bytes, None)
+                        .context("写入输出设备失败（设备可能已失效）")?;
                 }
+                // 事件超时（200ms 未就绪）不视为致命：正常背压下亦可能短暂等待，设备失效由上面两处检出。
                 let _ = self.h_event.wait_for_event(200);
             }
+            Ok(())
         }
     }
 
@@ -297,21 +308,22 @@ mod platform {
         }
 
         /// 阻塞播放一整段 24k 单声道（TTS）：重采样到设备率 + 交错到设备声道 → 写入 → 等抽干。
-        pub fn play(&mut self, samples24k: &[f32]) {
+        /// 输出流死亡时返回 Err，调用方据此停播上报。
+        pub fn play(&mut self, samples24k: &[f32]) -> Result<()> {
             if samples24k.is_empty() {
-                return;
+                return Ok(());
             }
             self.enqueue(samples24k, KOKORO_RATE as u32);
-            self.drain();
+            self.drain()
         }
 
         /// 播放一段已是 48k 单声道的 PCM（原声直通）：同上，输入率按 48k。
-        pub fn play_48k(&mut self, mono48: &[f32]) {
+        pub fn play_48k(&mut self, mono48: &[f32]) -> Result<()> {
             if mono48.is_empty() {
-                return;
+                return Ok(());
             }
             self.enqueue(mono48, 48_000);
-            self.drain();
+            self.drain()
         }
 
         /// 单声道输入 → 重采样到设备率 → 交错成设备声道 → 压入共享缓冲。
@@ -352,14 +364,30 @@ mod platform {
         }
 
         /// 阻塞到共享缓冲被回调抽干（近空）→ 保证串行不重叠。
-        fn drain(&self) {
+        /// 输出流死亡（设备热拔/CoreAudio 停摆）时回调不再消费缓冲：检测「一段时间无进展」
+        /// 即判致命，返回 Err 让调用方停播上报，避免旧实现无限自旋。
+        fn drain(&self) -> Result<()> {
+            // 无进展容忍上限：正常回调每几 ms 抽一次，2s 纹丝不动即判定流已死。
+            const STALL_LIMIT: Duration = Duration::from_secs(2);
+            let mut last_len = usize::MAX;
+            let mut stalled = Duration::ZERO;
             loop {
-                {
+                let len = {
                     let q = self.buf.lock().unwrap();
-                    if q.len() < self.channels {
-                        break;
+                    q.len()
+                };
+                if len < self.channels {
+                    return Ok(());
+                }
+                if len < last_len {
+                    stalled = Duration::ZERO; // 有进展：重置停滞计时
+                } else {
+                    stalled += Duration::from_millis(5);
+                    if stalled >= STALL_LIMIT {
+                        bail!("输出流停摆（设备可能已失效），丢弃未播完音频");
                     }
                 }
+                last_len = len;
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
