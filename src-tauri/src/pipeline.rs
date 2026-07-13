@@ -44,12 +44,6 @@ struct StatusEvent {
 /// 若每次重启从 1 计数会与上一轮残留条目撞号，导致主窗口回填错位。
 static NEXT_SUBTITLE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// out(麦克风/回灌)路径近场音量门阈值(段 RMS)。Silero VAD 只判「像不像人声」不判响度，
-/// 两个座位外的旁人说话照样是人声 → 会被收进出站流水线误识别、灌 TTS。这里用响度粗筛：
-/// 近场(你对着自己麦说话)响度远大于远场旁人，段 RMS 低于此阈值直接丢，不送 ASR。
-/// 只作用于 out；in(系统音频环回)是干净数字信号，不设门。阈值靠 [gate:out] 埋点观察后收紧。
-const MIC_GATE_RMS: f32 = 0.02;
-
 fn emit_status(app: &AppHandle, stop: &AtomicBool, dir: &str, state: &str, detail: Option<String>) {
     if stop.load(Ordering::SeqCst) {
         return; // 本流水线已停，丢弃迟到事件
@@ -148,7 +142,7 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     // 说话人分离开关（可运行中热切）；仅入站生效。启动值取配置。
     let diar_enabled = Arc::new(AtomicBool::new(cfg.diarization_enabled));
-    let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(6); // 采集 → 识别（有界，防积压）
+    let (seg_tx, seg_rx) = mpsc::sync_channel::<(Vec<f32>, crate::segmenter::CutReason)>(6); // 采集 → 识别（有界，防积压）
     // 识别 → 翻译（有界）：元素带说话人号(分离拆出的行)，None=未分离。
     let (txt_tx, txt_rx) = mpsc::sync_channel::<(u64, String, Option<i32>)>(32);
 
@@ -244,8 +238,10 @@ pub fn start(
     if seg_max_ov >= 3.0 {
         seg_limits.silero_max_s = seg_max_ov;
     }
-    // 断句停顿（高级可调）；下限 200ms 保证 < preroll(200ms) 不矛盾。
+    // 断句停顿（VAD 停顿=句界）：下限 200ms 保证 < preroll(200ms) 不矛盾。
     seg_limits.silero_min_silence_s = (cfg.seg_silence_ms.max(200) as f32) / 1000.0;
+    // ASR 线程 timeout 兜底用：距上一段超“上限+1s”无新段时强制定稿。
+    let seg_max_s = seg_limits.silero_max_s;
     thread::spawn(move || {
         if let Err(e) = capture::capture_thread(
             &source,
@@ -268,25 +264,25 @@ pub fn start(
     let engine = cfg.translation_engine.clone();
     let asr_engine = recognizer;
     let dir_asr = dir.clone();
-    // 说话人分离（仅入站）：开关热切读它；阈值启动时定；Diarizer 首次开启时在识别线程内惰性加载。
+    // 说话人分离（仅入站）：开关热切读它；整句贴标签用声纹提取器（惰性加载、复用 CAM++）。
     let diar_flag = diar_enabled.clone();
-    let diar_threshold = cfg.diarization_threshold;
-    // 全局说话人库跨段归并阈值（可调）：段声纹与说话人质心相似度 ≥ 此值即归为同一人。
+    // 全局说话人库跨段归并阈值（可调）：整句声纹与说话人质心相似度 ≥ 此值即归为同一人。
     let spk_match = cfg.speaker_merge_threshold;
-    // 引擎名（判是否支持分离：Qwen3 无 token 时间戳，排除）
-    let asr_engine_name = cfg.asr_engine.clone();
+    // 近场音量门（可调）：段 RMS 低于此判为远场旁人/杂音，丢弃不识别。仅麦克风源生效（回灌出站 + 麦克风翻译），环回系统声响度天然波动大，不设门。
+    let mic_gate_rms = cfg.mic_gate_rms;
+    let mic_source = cfg.source == "microphone";
+    // 句缓冲超长强制定稿时长（墙钟）：无停顿连续独白兜底。
+    let sentence_max_samples = (cfg.sentence_max_s.max(3.0) * 16_000.0) as usize;
     thread::spawn(move || {
         emit_status(&app_asr, &stop_asr, &dir_asr, "listening", None);
 
-        // VAD 双阈值已保证每段≈一句完整话，识别结果直接成条（SenseVoice 自带标点/ITN）。
-        // 惰性加载的说话人分离器（仅入站、开关开启首次用到才加载；模型缺失/失败则保持 None 降级不拆）
-        let mut diarizer: Option<crate::diarize::Diarizer> = None;
-        // 是否已尝试加载分离器（失败也置 true，避免每段重试刷屏）
-        let mut diar_tried = false;
-        // 全局说话人库（A 在线增量）：跨段把同一个人归到稳定编号。
-        // 复用声纹那份 CAM++ 提向量；提取器惰性加载（与分离器同期），库随会话存活、停止即弃。
+        // 攒句定稿：VAD 段只是喂料，累积成完整句才是翻译/落盘/贴标签单元（见 docs/实时精确断句-设计方案.md）。
+        // 全局说话人库（整句贴标签）：复用 CAM++ 声纹提取器 + 会话级 SpeakerRegistry，惰性加载。
         let mut spk_extractor: Option<crate::voiceprint::Extractor> = None;
         let mut spk_tried = false;
+        // diarize-first 段内分离器（pyannote+CAM++）：定稿时检测块内是否多人、按人切音频。惰性加载一次。
+        let mut spk_diarizer: Option<crate::diarize::Diarizer> = None;
+        let mut diar_tried = false;
         let mut spk_registry = crate::diarize::SpeakerRegistry::new();
 
         // 发一条字幕原文（translated 空，pending 由调用方定，可带说话人号）
@@ -327,38 +323,166 @@ pub fn start(
                 Err(mpsc::TrySendError::Disconnected(_)) => {}
             }
         };
-        // 普通（不分离）单段：纯字幕模式原文即终态；否则原文先显示再送翻译。
-        let flush_one = |text: String| {
-            let id = NEXT_SUBTITLE_ID.fetch_add(1, Ordering::Relaxed) + 1;
-            if engine == "none" {
-                emit_orig(id, text, None, false);
-            } else {
-                emit_orig(id, text.clone(), None, true);
-                send_tr(id, text, None);
+        // 重识别用的 ASR 句柄（Arc 克隆）：diarize-first 多人分支里，对切出的单人音频重跑识别。
+        let asr_commit = asr_engine.clone();
+        // 三档归号：对一段音频提声纹归全局号（<1.3s 未知；1.3~2.5s 只挂已知不新建；≥2.5s 可新建）。
+        let assign_speaker = |audio: &[f32],
+                              ex: &Option<crate::voiceprint::Extractor>,
+                              reg: &mut crate::diarize::SpeakerRegistry|
+         -> Option<i32> {
+            const SHORT_SAMPLES: usize = 20_800; // 1.3s
+            const RELIABLE_SAMPLES: usize = 40_000; // 2.5s
+            if audio.len() < SHORT_SAMPLES {
+                return None;
             }
+            ex.as_ref().and_then(|e| e.embed(audio)).and_then(|emb| {
+                if audio.len() >= RELIABLE_SAMPLES {
+                    Some(reg.assign(&emb, spk_match))
+                } else {
+                    reg.match_only(&emb, spk_match)
+                }
+            })
+        };
+        // 出一行字幕（原文即时显示 + 送翻译；none 引擎只出原文终态）。
+        let emit_line = |id: u64, text: String, speaker: Option<i32>| {
+            if engine == "none" {
+                emit_orig(id, text, speaker, false);
+            } else {
+                emit_orig(id, text.clone(), speaker, true);
+                send_tr(id, text, speaker);
+            }
+        };
+        // 定稿：把当前句缓冲作为一句提交。
+        //   want_speaker + 分离器可用 + 块够长 → diarize-first：块内按人切音频，逐段重识别 + 归号 + 多行出。
+        //   单人 / 不满足条件 → 整句一行、整句归号（三档）。
+        // buf/audio/id 由调用方传入并在调用后自行重置；spk_extractor/diarizer/registry 以参数传入避免借用冲突。
+        let commit = |text: &str,
+                      audio: &[f32],
+                      id: u64,
+                      ex: &Option<crate::voiceprint::Extractor>,
+                      diar: &Option<crate::diarize::Diarizer>,
+                      reg: &mut crate::diarize::SpeakerRegistry| {
+            let t = text.trim();
+            if t.is_empty() {
+                return;
+            }
+            let want_speaker = dir_asr == "in" && diar_flag.load(Ordering::Relaxed);
+            // ---- diarize-first 段内分离（仅入站 + 分离开关 + 块够长）----
+            const MIN_DIAR_SAMPLES: usize = 48_000; // 3s：太短的块不值当分离、易过分割
+            const MIN_TURN_S: f32 = 0.8; // 短于此的轮次并入相邻，消灭碎片
+            if want_speaker && audio.len() >= MIN_DIAR_SAMPLES {
+                if let Some(d) = diar {
+                    let turns =
+                        crate::diarize::split_turns(&d.process(audio), audio.len(), MIN_TURN_S);
+                    let distinct = {
+                        let mut v: Vec<i32> = turns.iter().map(|x| x.2).collect();
+                        v.sort_unstable();
+                        v.dedup();
+                        v.len()
+                    };
+                    if distinct >= 2 && turns.len() >= 2 {
+                        // 尊重 pyannote 局部号：为每个局部号定一个全局号——用该局部号的全部音频（各轮拼接）
+                        // 提一次声纹归号；同局部→同全局；不同局部强制不同全局（阈值 2.0 使 assign 必新建，
+                        // cosine≤1<2 永不命中），不让 CAM++ 把 pyannote 已分开的人并回同一号。CAM++ 只用于跨块衔接。
+                        const SHORT_SAMPLES: usize = 20_800; // 1.3s：短于此声纹不可信 → 标未知
+                        let mut label_audio: std::collections::HashMap<i32, Vec<f32>> =
+                            std::collections::HashMap::new();
+                        for &(a, b, local) in &turns {
+                            label_audio
+                                .entry(local)
+                                .or_default()
+                                .extend_from_slice(&audio[a..b]);
+                        }
+                        let mut label_global: std::collections::HashMap<i32, Option<i32>> =
+                            std::collections::HashMap::new();
+                        let mut used: Vec<i32> = Vec::new();
+                        for (local, laud) in &label_audio {
+                            let g = if laud.len() < SHORT_SAMPLES {
+                                None
+                            } else if let Some(emb) = ex.as_ref().and_then(|e| e.embed(laud)) {
+                                let mut g = reg.assign(&emb, spk_match);
+                                if used.contains(&g) {
+                                    g = reg.assign(&emb, 2.0); // 本块已占该号 → 强制新建
+                                }
+                                used.push(g);
+                                Some(g)
+                            } else {
+                                None
+                            };
+                            label_global.insert(*local, g);
+                        }
+                        // 逐轮重识别 + 出行；说话人号查 label_global。首轮复用 id（替换已显示的 pending 行），其余新建 id。
+                        let mut emitted = false;
+                        for (a, b, local) in turns {
+                            let sub = asr_commit.transcribe(&audio[a..b]).trim().to_string();
+                            // 空/纯标点/幻觉的碎片跳过，不出行
+                            if sub.is_empty()
+                                || !sub.chars().any(|c| c.is_alphanumeric())
+                                || asr::is_hallucination(&sub)
+                                || asr::is_filler_hallucination(&sub)
+                            {
+                                continue;
+                            }
+                            let spk = label_global.get(&local).copied().flatten();
+                            let line_id = if emitted {
+                                NEXT_SUBTITLE_ID.fetch_add(1, Ordering::Relaxed) + 1
+                            } else {
+                                id
+                            };
+                            emit_line(line_id, sub, spk);
+                            emitted = true;
+                        }
+                        // 只要出过至少一行就算处理完；全被过滤才落到下面整句兜底，避免这句整块消失。
+                        if emitted {
+                            return;
+                        }
+                    }
+                }
+            }
+            // ---- 单人 / 不分离：整句一行 ----
+            let speaker = if want_speaker {
+                assign_speaker(audio, ex, reg)
+            } else {
+                None
+            };
+            emit_line(id, t.to_string(), speaker);
         };
 
         // 声纹维度失配只告警一次（模型换代/旧 voiceprint.json）：避免每段刷屏。
         let mut vp_dim_warned = false;
+
+        // ===== 攒句缓冲 =====
+        let mut buf_text = String::new(); // 累积原文
+        let mut buf_audio: Vec<f32> = Vec::new(); // 累积 16k 音频（仅贴标签时用）
+        let mut buf_id: u64 = 0; // 当前句 id（活跃期间刷新原文，定稿回填译文）
+        let mut buf_open = false; // 是否有活跃句
+        let mut buf_samples: usize = 0; // 累积音频样本数（超长兜底按音频算，不受 ASR 处理速度影响）
+        let mut last_voice = Instant::now(); // 上一段到达时刻（timeout 兜底用）
+        // 断句下沉到 VAD：VAD 停顿(0.75s)切段即句界，并给段打 Pause/Max 标签。
+        // ASR 据标签：Pause 切(停顿)立即定稿；Max 切(顶到上限、半句)继续攒，靠 sentence_max 硬兜底。
 
         loop {
             if stop_asr.load(Ordering::Relaxed) {
                 break;
             }
             match seg_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(seg) => {
-                    // 近场音量门(仅 out)：算段 RMS，低于阈值判为远场旁人/环境，丢弃不识别。in 路径不设门。
-                    if dir_asr == "out" {
+                Ok((seg, cut)) => {
+                    // 段到达时刻（transcribe 前取，用于测真实段间停顿，避免 ASR 耗时污染间隔）
+                    let recv_at = Instant::now();
+                    // 近场音量门：麦克风源(回灌出站 + 麦克风翻译)按段 RMS 挡远场旁人/杂音；环回系统声响度天然波动大，不设门。
+                    if mic_source {
                         let rms = if seg.is_empty() {
                             0.0
                         } else {
                             (seg.iter().map(|s| s * s).sum::<f32>() / seg.len() as f32).sqrt()
                         };
-                        if rms < MIC_GATE_RMS {
+                        if rms < mic_gate_rms {
                             continue;
                         }
-                        // 声纹门：过了音量粗筛再比对登记声纹，非本人（旁人）直接丢。
-                        // 未登记/未开启时 gate 为 None，自动降级只保留 RMS 门。
+                    }
+                    // 声纹门(仅回灌出站)：过了音量粗筛再比对登记声纹，非本人（旁人）直接丢。
+                    // 未登记/未开启时 gate 为 None，自动降级只保留 RMS 门。
+                    if dir_asr == "out" {
                         if let Some(g) = &gate {
                             match g.accepts(&seg) {
                                 crate::voiceprint::GateDecision::Accept => {}
@@ -380,22 +504,8 @@ pub fn start(
                         }
                     }
                     emit_status(&app_asr, &stop_asr, &dir_asr, "recognizing", None);
-                    // 入站且分离开启 → 取识别细节（含 token 时间戳）以便按说话人切文本；否则只取文本。
-                    // Qwen3 是 LLM 解码、不产 token 时间戳，无法分离，直接排除——省去 transcribe_detailed 的额外开销。
-                    let want_diar = dir_asr == "in"
-                        && diar_flag.load(Ordering::Relaxed)
-                        && asr_engine_name != "qwen3Asr";
-                    let detail = if want_diar {
-                        asr_engine.transcribe_detailed(&seg)
-                    } else {
-                        asr::AsrDetail {
-                            text: asr_engine.transcribe(&seg),
-                            tokens: Vec::new(),
-                            timestamps: None,
-                        }
-                    };
+                    let text = asr_engine.transcribe(&seg).trim().to_string();
                     emit_status(&app_asr, &stop_asr, &dir_asr, "listening", None);
-                    let text = detail.text.trim().to_string();
                     if text.is_empty() {
                         continue;
                     }
@@ -420,124 +530,86 @@ pub fn start(
                         eprintln!("[asr] 丢弃模板泄漏段：{}", text);
                         continue;
                     }
-                    // 说话人分离路径（入站 + 开关 + 有非空 token 时间戳）：同步跑 diar + 提声纹并入
-                    // 全局说话人库，据结果整段翻译或按（全局稳定编号的）说话人拆成多行（门控单次翻译）。
-                    // 无时间戳的引擎(如 Qwen3 返回空时间戳)不进此路径，也不加载分离模型。
-                    let has_ts = detail.timestamps.as_ref().map_or(false, |t| !t.is_empty());
-                    if want_diar && has_ts {
-                        if diarizer.is_none() && !diar_tried {
-                            diar_tried = true;
-                            match crate::diarize::Diarizer::load(&app_asr, 1, diar_threshold) {
-                                Ok(d) => {
-                                    eprintln!("[diar:in] 分离器已加载（threshold={:.2}）", diar_threshold);
-                                    diarizer = Some(d);
-                                }
-                                Err(e) => eprintln!("[diar:in] 未启用（{e:#}）"),
-                            }
+                    // ===== 攒句 =====
+                    let want_speaker = dir_asr == "in" && diar_flag.load(Ordering::Relaxed);
+                    // 贴标签需要声纹提取器，惰性加载一次
+                    if want_speaker && spk_extractor.is_none() && !spk_tried {
+                        spk_tried = true;
+                        match crate::voiceprint::Extractor::load(&app_asr, 1) {
+                            Ok(e) => spk_extractor = Some(e),
+                            Err(e) => eprintln!("[spk:in] 声纹提取器不可用，说话人不标注（{e:#}）"),
                         }
-                        if let (Some(d), Some(ts)) = (diarizer.as_ref(), detail.timestamps.as_ref()) {
-                            // 惰性加载声纹提取器（全局说话人库要用它把每段/每行的声纹并入库）
-                            if spk_extractor.is_none() && !spk_tried {
-                                spk_tried = true;
-                                match crate::voiceprint::Extractor::load(&app_asr, 1) {
-                                    Ok(e) => {
-                                        eprintln!("[diar:in] 全局说话人库已启用（跨段声纹归并）");
-                                        spk_extractor = Some(e);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[diar:in] 声纹提取器不可用，退化为仅段内分离（{e:#}）"
-                                    ),
-                                }
-                            }
-                            // 同步跑 diar（几十毫秒）拿子段
-                            let parts = d.process(&seg);
-                            let mut spk: Vec<i32> = parts.iter().map(|p| p.2).collect();
-                            spk.sort_unstable();
-                            spk.dedup();
-                            // 切 [a,b) 段样本提声纹 → 并入全局库，返回全局编号；提不出返回 None
-                            const MIN_EMB: usize = 12_800; // 0.8s：短于此声纹不稳，只挂已有、绝不新建
-                            let seg_ref = &seg;
-                            let ex_ref = &spk_extractor;
-                            let mut assign_g = |a: usize, b: usize| -> Option<i32> {
-                                let ex = ex_ref.as_ref()?;
-                                let a = a.min(seg_ref.len());
-                                let b = b.min(seg_ref.len());
-                                if b <= a {
-                                    return None;
-                                }
-                                let emb = ex.embed(&seg_ref[a..b])?;
-                                if b - a < MIN_EMB {
-                                    // 短段：只往已知说话人挂，挂不上标未知，不新建虚假编号
-                                    spk_registry.match_only(&emb, spk_match)
-                                } else {
-                                    Some(spk_registry.assign(&emb, spk_match))
-                                }
-                            };
-                            // 段内多人才逐行归属；否则整段一个人
-                            let (labeled, split): (Vec<(Option<i32>, String)>, bool) =
-                                if spk.len() >= 2 {
-                                    let runs =
-                                        crate::diarize::attribute(&detail.tokens, ts, &parts);
-                                    let mut local2g: std::collections::HashMap<i32, i32> =
-                                        std::collections::HashMap::new();
-                                    let mut v: Vec<(Option<i32>, String)> =
-                                        Vec::with_capacity(runs.len());
-                                    for (local, line, t0, t1) in &runs {
-                                        let a = (t0 * 16_000.0) as usize;
-                                        let b = (t1 * 16_000.0) as usize + 1;
-                                        // 提不出声纹（行太短）时，复用本段同一局部说话人已定的全局号，防漂
-                                        let g = assign_g(a, b)
-                                            .or_else(|| local2g.get(local).copied());
-                                        if let Some(g) = g {
-                                            local2g.entry(*local).or_insert(g);
-                                        }
-                                        v.push((g, line.clone()));
-                                    }
-                                    let distinct = v
-                                        .iter()
-                                        .filter_map(|x| x.0)
-                                        .collect::<std::collections::HashSet<_>>()
-                                        .len();
-                                    let split = v.len() >= 2 && distinct >= 2;
-                                    (v, split)
-                                } else {
-                                    (Vec::new(), false)
-                                };
-                            if split {
-                                // 多说话人：逐行发（同步执行→id 连续、顺序正确），speaker 为全局稳定编号
-                                for (g, line) in &labeled {
-                                    let lid =
-                                        NEXT_SUBTITLE_ID.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if engine == "none" {
-                                        emit_orig(lid, line.clone(), *g, false);
-                                    } else {
-                                        emit_orig(lid, line.clone(), *g, true);
-                                        send_tr(lid, line.clone(), *g);
-                                    }
-                                }
-                            } else {
-                                // 单人 / 拆分塌缩：整段一个说话人。已算过则复用，否则整段提一次声纹。
-                                let g = labeled
-                                    .iter()
-                                    .find_map(|x| x.0)
-                                    .or_else(|| assign_g(0, seg.len()));
-                                let id = NEXT_SUBTITLE_ID.fetch_add(1, Ordering::Relaxed) + 1;
-                                if engine == "none" {
-                                    emit_orig(id, text.clone(), g, false);
-                                } else {
-                                    emit_orig(id, text.clone(), g, true);
-                                    send_tr(id, text.clone(), g);
-                                }
-                            }
+                    }
+                    // 段内分离器惰性加载一次（缺 pyannote/CAM++ 则降级为不分离，只按整句归号）。
+                    if want_speaker && spk_diarizer.is_none() && !diar_tried {
+                        diar_tried = true;
+                        // 聚类阈值 0.7（越大说话人越少，偏保守防单人块被过分割）。
+                        match crate::diarize::Diarizer::load(&app_asr, 1, 0.7) {
+                            Ok(d) => spk_diarizer = Some(d),
+                            Err(e) => eprintln!("[diar:in] 段内分离器不可用，退回整句归号（{e:#}）"),
+                        }
+                    }
+                    // 瑕疵修复：preroll 段间重叠会把上段末尾词再识别成极短碎渣（如「ます。」）。
+                    // 极短段 且 其文本正是当前句末尾后缀 → 判重复碎渣，丢弃不追加。
+                    const TINY_SAMPLES: usize = 6_400; // 0.4s
+                    if buf_open && seg.len() < TINY_SAMPLES {
+                        let strip =
+                            |c: char| matches!(c, '。' | '．' | '.' | '…' | '、' | '，' | ',' | ' ');
+                        let tail = buf_text.trim_end_matches(strip);
+                        let cur = text.trim_end_matches(strip).trim();
+                        if !cur.is_empty() && tail.ends_with(cur) {
+                            last_voice = recv_at;
                             continue;
                         }
-                        // diar 不可用（加载失败/无时间戳）→ 落普通路径
                     }
-                    flush_one(text);
+                    // 说话人切换定稿已移除：段级声纹波动大（同人相邻段余弦可差 ±20%），据此切句是噪声误切；
+                    // 换人分句改由 timeout 停顿定稿承担，归号由定稿时整句 assign 完成（整句声纹更稳）。
+                    last_voice = recv_at;
+                    // 开新句 or 追加喂料段
+                    if !buf_open {
+                        buf_id = NEXT_SUBTITLE_ID.fetch_add(1, Ordering::Relaxed) + 1;
+                        buf_open = true;
+                        buf_samples = 0;
+                        buf_text.clear();
+                        buf_audio.clear();
+                    }
+                    if !buf_text.is_empty() {
+                        buf_text.push(' ');
+                    }
+                    buf_text.push_str(&text);
+                    if want_speaker {
+                        buf_audio.extend_from_slice(&seg);
+                    }
+                    // 原文即时显示（pending，说话人号待定稿）
+                    emit_orig(buf_id, buf_text.clone(), None, true);
+                    // 断句：VAD 已在停顿处切段并标好切因。
+                    // Pause 切(停顿=句界)立即定稿；Max 切(顶到上限=半句)继续攒，靠 sentence_max 硬兜底。
+                    let is_max = matches!(cut, crate::segmenter::CutReason::Max);
+                    buf_samples += seg.len();
+                    if !is_max || buf_samples >= sentence_max_samples {
+                        commit(&buf_text, &buf_audio, buf_id, &spk_extractor, &spk_diarizer, &mut spk_registry);
+                        buf_open = false;
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // 定稿主路已由“收到停顿切段”触发（VAD 已确认停顿）。
+                    // 此处仅做兜底：若句缓冲开着且距上一段超过“上限+1s”都无新段（说话人真停了、
+                    // 且末段被误判为上限切），强制定稿，避免末句卡到 sentence_max。
+                    // 阈值 > 上限保证不会在连续独白（段间隔≤上限）中途偼跑。
+                    if buf_open {
+                        let stopped = Instant::now().duration_since(last_voice);
+                        if stopped >= Duration::from_secs_f32(seg_max_s + 1.0) {
+                            commit(&buf_text, &buf_audio, buf_id, &spk_extractor, &spk_diarizer, &mut spk_registry);
+                            buf_open = false;
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // 停止前 flush 残留句
+        if buf_open {
+            commit(&buf_text, &buf_audio, buf_id, &spk_extractor, &spk_diarizer, &mut spk_registry);
         }
     });
 
@@ -574,7 +646,7 @@ pub fn start(
         let tts_tx = tts_tx.clone();
         thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30)) // 兜底救偶发长句：本地 CPU 慢模型长句可能 20~30s，给足时间再放弃
+                .timeout(Duration::from_secs(cfg.translate_timeout_s)) // 兜底救偶发长句：本地 CPU 慢模型长句可能 20~30s，给足时间再放弃
                 .build()
                 .expect("http client");
             loop {

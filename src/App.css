@@ -1790,6 +1790,13 @@ body {
   margin-top: -16px;
   margin-bottom: 8px;
 }
+/* 高级/门控：设置与设置之间留出更明显的间距（上一条说明 → 下一条控件），
+   与「滑块→说明」的紧贴形成对比，让每项设置成组更好认。
+   下一条控件可能是滑块(.vp-slider)，也可能是开关(.toggle-row) */
+.vp-section .info-line + .field.vp-slider,
+.vp-section .info-line + .toggle-row {
+  margin-top: 16px;
+}
 
 .field label {
   font-size: 12px;

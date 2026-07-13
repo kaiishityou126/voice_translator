@@ -39,6 +39,8 @@ pub trait Asr: Send + Sync {
 
 /// 识别细节：文本 + 逐 token 文本 + 逐 token 起始秒（tokens 与 timestamps 等长）。
 /// timestamps=None 表示该引擎不给时间戳（说话人分离无法切文本，退化为整段）。
+/// 攒句方案下整句贴标签不再句内切分，tokens/timestamps 暂未使用但保留以备将来句内切分。
+#[allow(dead_code)]
 pub struct AsrDetail {
     pub text: String,
     pub tokens: Vec<String>,
@@ -488,13 +490,6 @@ impl AutoSenseVoice {
         let stream = self.lid.create_stream();
         stream.accept_waveform(16_000, head);
         let raw = self.lid.compute(&stream).map(|r| r.lang).unwrap_or_default();
-        // 诊断：段总长 + 实际喂给 LID 的长度 + LID 原始输出，定位判错/判空
-        eprintln!(
-            "[lid] seg={:.2}s lid_in={:.2}s raw=\"{}\"",
-            samples.len() as f32 / 16_000.0,
-            head.len() as f32 / 16_000.0,
-            raw
-        );
         match raw.as_str() {
             "zh" | "en" | "ja" | "ko" | "yue" => raw,
             _ => "auto".to_string(),
@@ -526,12 +521,6 @@ impl Asr for AutoSenseVoice {
         } else {
             self.transcribe_fixed_detailed(&lang, samples)
         };
-        eprintln!(
-            "[lid] route={} dur={:.2}s text=\"{}\"",
-            lang,
-            samples.len() as f32 / 16_000.0,
-            out.text
-        );
         out
     }
 

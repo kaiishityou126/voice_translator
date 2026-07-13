@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cargo check *)",
-      "Bash(xargs wc -l)"
+      "Bash(xargs wc -l)",
+      "Bash(grep -v \"^\\\\s*//\")"
     ]
   }
 }

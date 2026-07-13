@@ -32,10 +32,6 @@ fn default_voiceprint_threshold() -> f32 {
     0.5
 }
 
-fn default_diarization_threshold() -> f32 {
-    0.7
-}
-
 fn default_speaker_merge_threshold() -> f32 {
     0.55
 }
@@ -50,6 +46,18 @@ fn default_seg_max_sv() -> f32 {
 
 fn default_seg_max_qwen3() -> f32 {
     10.0
+}
+
+fn default_sentence_max_s() -> f32 {
+    18.0
+}
+
+fn default_mic_gate_rms() -> f32 {
+    0.02
+}
+
+fn default_translate_timeout_s() -> u64 {
+    30
 }
 
 /// LLM 模型库中的一条（云端 OpenAI 兼容 或 本地 Ollama）。翻译与提炼按 id 从库里选用。
@@ -153,9 +161,6 @@ pub struct RuntimeConfig {
     /// 说话人分离（仅入站）：开启后把一段里不同说话人的话按 token 时间戳拆成多行并标注。实验性，默认关，可运行中热切。
     #[serde(default)]
     pub diarization_enabled: bool,
-    /// 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
-    #[serde(default = "default_diarization_threshold")]
-    pub diarization_threshold: f32,
     /// 全局说话人库跨段归并阈值（余弦）：段声纹与某说话人质心相似度 ≥ 此值即归为同一人。
     /// 越大→归并越严（同一人易裂成多号），越小→归并越松（易把两人归成一号）。默认 0.55。
     #[serde(default = "default_speaker_merge_threshold")]
@@ -167,9 +172,19 @@ pub struct RuntimeConfig {
     /// 分段最大时长·Qwen3（秒）：默认 10（需更长上下文）。
     #[serde(default = "default_seg_max_qwen3")]
     pub seg_max_sec_qwen3: f32,
-    /// 断句停顿时长（毫秒）：连续静音达此才断句切段。默认 500。
+    /// VAD 停顿（句界，毫秒）：连续静音达此 VAD 切一句（停顿切）。默认 500。
     #[serde(default = "default_seg_silence_ms")]
     pub seg_silence_ms: u64,
+    /// 句缓冲超长强制定稿（秒）：无停顿连续说到此时长，强制切句。默认 25。
+    #[serde(default = "default_sentence_max_s")]
+    pub sentence_max_s: f32,
+    /// 出站近场音量门（段 RMS）：仅出站，段响度低于此判为远场旁人/环境，丢弃不识别。默认 0.02。
+    /// 不同麦克风/环境响度差异大，可按需微调（调大更严挡旁人、调小更宽松）。
+    #[serde(default = "default_mic_gate_rms")]
+    pub mic_gate_rms: f32,
+    /// 翻译单请求 HTTP 超时（秒）：慢的本地大模型长句可能耗时较久，超此判失败。默认 30。
+    #[serde(default = "default_translate_timeout_s")]
+    pub translate_timeout_s: u64,
 }
 
 impl RuntimeConfig {

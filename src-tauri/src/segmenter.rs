@@ -9,6 +9,13 @@ use std::path::Path;
 
 const SAMPLE_RATE: usize = 16_000;
 
+/// 段的切因：Pause=停顿切（句界，可立即定稿）；Max=顶到时长上限强切（半句，需续接）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CutReason {
+    Pause,
+    Max,
+}
+
 /// 按 ASR 引擎区分的切段时长上限（秒）。两个引擎对段长的偏好相反：
 /// - SenseVoice：非流式 CTC，段越长越易把连续快语退化成同音乱码 → 短段（实时优先）；
 /// - Qwen3-ASR：自回归 LLM 解码器，需完整句子上下文压低幻觉/模板泄漏，可接受延迟 → 长段。
@@ -67,7 +74,8 @@ impl Segmenter {
     }
 
     /// 喂入任意长度 16k 单声道样本，完整切出的语音段追加到 `out`。
-    pub fn push(&mut self, samples: &[f32], out: &mut Vec<Vec<f32>>) {
+    /// 喂入任意长度的 16k 单声道样本，完整切出的语音段（带切因）追加到 `out`。
+    pub fn push(&mut self, samples: &[f32], out: &mut Vec<(Vec<f32>, CutReason)>) {
         match self {
             Segmenter::Silero(s) => s.push(samples, out),
             Segmenter::Energy(e) => e.push(samples, out),
@@ -83,7 +91,7 @@ impl Segmenter {
     }
 
     /// 强制收尾未完成的段（播放停止时防卡半句）。
-    pub fn flush(&mut self, out: &mut Vec<Vec<f32>>) {
+    pub fn flush(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>) {
         match self {
             Segmenter::Silero(s) => s.flush(out),
             Segmenter::Energy(e) => e.flush(out),
@@ -145,7 +153,7 @@ impl SileroCore {
         })
     }
 
-    fn push(&mut self, samples: &[f32], out: &mut Vec<Vec<f32>>) {
+    fn push(&mut self, samples: &[f32], out: &mut Vec<(Vec<f32>, CutReason)>) {
         // sherpa VAD 内部按 window_size 缓冲处理，可直接喂任意长度。
         self.vad.accept_waveform(samples);
         // 同步进环形缓冲，仅保留最近 ring_cap 个样本，供取段时补句首。
@@ -154,22 +162,23 @@ impl SileroCore {
             self.ring.pop_front();
         }
         self.fed += samples.len() as u64;
-        // 硬上限兼底：自己数连续语音时长，超 silero_max_s 就 flush 强制切一段。
-        // 既将段长压回上限，又让输出按上限节奏出（缓解“攛一会一下子放”的爆发）。
-        // 自然有停顿的句子仍由 min_silence 在停顿处切，只有连续超时才被强切。
+        // 先取出自然结束（静音达 min_silence）的段，标 Pause（句界）。
+        self.drain(out, CutReason::Pause);
+        // 再处理上限强切：自己数连续语音时长，超 silero_max_s 就 flush 强切一段，标 Max（半句）。
+        // 自然有停顿的句子仍由 min_silence 在停顿处切(Pause)，只有连续超时才被强切(Max)。
         if self.vad.detected() {
             self.open_samples += samples.len();
             if self.open_samples >= self.max_open_samples {
                 self.vad.flush();
                 self.open_samples = 0;
+                self.drain(out, CutReason::Max);
             }
         } else {
             self.open_samples = 0;
         }
-        self.drain(out);
     }
 
-    fn drain(&mut self, out: &mut Vec<Vec<f32>>) {
+    fn drain(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>, cut: CutReason) {
         while let Some(seg) = self.vad.front() {
             let samples = seg.samples();
             if samples.len() >= self.min_samples {
@@ -187,7 +196,7 @@ impl SileroCore {
                     }
                 }
                 seg_out.extend_from_slice(samples);
-                out.push(seg_out);
+                out.push((seg_out, cut));
             }
             drop(seg);
             self.vad.pop();
@@ -198,10 +207,10 @@ impl SileroCore {
         self.vad.detected()
     }
 
-    fn flush(&mut self, out: &mut Vec<Vec<f32>>) {
-        // 强制把内部缓冲里残留的语音收尾成段，再取出。
+    fn flush(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>) {
+        // 强制把内部缓冲里残留的语音收尾成段，再取出。收尾残段当句界（Pause）。
         self.vad.flush();
-        self.drain(out);
+        self.drain(out, CutReason::Pause);
     }
 }
 
@@ -271,8 +280,8 @@ impl EnergyCore {
         }
     }
 
-    /// 喂入任意长度的 16k 单声道样本，完整切出的语音段追加到 `out`。
-    fn push(&mut self, samples: &[f32], out: &mut Vec<Vec<f32>>) {
+    /// 喂入任意长度的 16k 单声道样本，完整切出的语音段（带切因）追加到 `out`。
+    fn push(&mut self, samples: &[f32], out: &mut Vec<(Vec<f32>, CutReason)>) {
         self.leftover.extend_from_slice(samples);
         let frame = self.frame;
         // 取出 frame_buf 为局部变量，避免「借用 self.leftover」与「&mut self.vad」冲突
@@ -291,7 +300,7 @@ impl EnergyCore {
         }
     }
 
-    fn handle(&mut self, voiced: bool, frame: &[f32], out: &mut Vec<Vec<f32>>) {
+    fn handle(&mut self, voiced: bool, frame: &[f32], out: &mut Vec<(Vec<f32>, CutReason)>) {
         if !self.in_speech {
             for &s in frame {
                 self.preroll.push_back(s);
@@ -314,26 +323,26 @@ impl EnergyCore {
                 self.silence_run += frame.len();
                 // 长停 = 句末，正常收尾（换气类短停 < 此阈值，会被容忍，不切）。
                 if self.silence_run >= self.silence_long {
-                    self.finalize(out);
+                    self.finalize(out, CutReason::Pause);
                     return;
                 }
                 // 短停 = 可能换气：仅当本段已超软上限时才在此收尾，
                 // 避免长句拖到硬上限被拦腰斩断（断点处的词缺右侧上下文，最易识别错）。
                 if self.silence_run >= self.silence_short && self.cur.len() >= self.soft_max_samples {
-                    self.finalize(out);
+                    self.finalize(out, CutReason::Pause);
                     return;
                 }
             }
             if self.cur.len() >= self.max_samples {
-                self.finalize(out);
+                self.finalize(out, CutReason::Max);
             }
         }
     }
 
-    fn finalize(&mut self, out: &mut Vec<Vec<f32>>) {
+    fn finalize(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>, cut: CutReason) {
         let keep = self.cur.len().saturating_sub(self.silence_run);
         if keep >= self.min_speech_samples {
-            out.push(self.cur[..keep].to_vec());
+            out.push((self.cur[..keep].to_vec(), cut));
         }
         self.cur.clear();
         self.preroll.clear();
@@ -345,9 +354,9 @@ impl EnergyCore {
         self.in_speech
     }
 
-    pub fn flush(&mut self, out: &mut Vec<Vec<f32>>) {
+    pub fn flush(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>) {
         if self.in_speech {
-            self.finalize(out);
+            self.finalize(out, CutReason::Pause);
         }
     }
 }

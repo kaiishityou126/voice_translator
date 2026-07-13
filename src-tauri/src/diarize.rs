@@ -5,6 +5,10 @@
 //!   + CAM++（复用声纹那份 campplus_sv_zh_16k.onnx）提说话人嵌入，
 //!   + FastClustering（num_clusters=-1 自动定人数）聚类。
 //! 段模型缺失时 `load` 返回 Err，调用方静默降级为「不分离」。
+//!
+//! 注：攒句方案已改为「整句贴标签」（仅用 SpeakerRegistry）；pyannote 段内切分
+//! （Diarizer/attribute/speaker_at 等）暂不使用但保留以备将来句内切分，故压制其 dead_code 告警。
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -92,6 +96,75 @@ impl Diarizer {
         }
     }
 }
+
+/// 把 pyannote 的 (start_s,end_s,spk) 片段整成「音频样本区间」的说话人轮次（diarize-first 用）：
+///   0) 按开始时间贪心裁剪成**不重叠**轮次（pyannote 重叠检测会对单人连续语流误报「第二人叠说」，
+///      返回时间上压着的段；不裁剪则两段覆盖同一音频，重识别吐出重复文字）；
+///   1) 相邻同说话人合并；2) 短于 min_turn_s 的轮次并入相邻（吞并、随邻居说话人，消灭碎片）；
+///   3) 吞并后再合一次同说话人；4) 秒→16k 样本下标，clamp 到 total。
+/// 返回按时间序的 (start_sample, end_sample, local_spk)。local_spk 为段内 pyannote 号（未跨段归一）。
+pub fn split_turns(parts: &[(f32, f32, i32)], total: usize, min_turn_s: f32) -> Vec<(usize, usize, i32)> {
+    const SR: f32 = 16_000.0;
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    // 相邻同说话人合并
+    fn merge_same(v: &mut Vec<(f32, f32, i32)>) {
+        let mut out: Vec<(f32, f32, i32)> = Vec::new();
+        for &(s, e, spk) in v.iter() {
+            if let Some(l) = out.last_mut() {
+                if l.2 == spk {
+                    if e > l.1 {
+                        l.1 = e;
+                    }
+                    continue;
+                }
+            }
+            out.push((s, e, spk));
+        }
+        *v = out;
+    }
+    // 0) 贪心裁剪成不重叠轮次：按开始时间排序，每段起点抬到上一轮末端之后；
+    //    完全被前段覆盖的段直接丢弃（重叠误报），避免两段覆盖同一音频导致重复文字。
+    let mut sorted: Vec<(f32, f32, i32)> = parts.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut turns: Vec<(f32, f32, i32)> = Vec::new();
+    let mut cursor = 0.0f32;
+    for (s, e, spk) in sorted {
+        let start = s.max(cursor);
+        if e <= start {
+            continue; // 完全落在已处理区间内 → 丢弃
+        }
+        turns.push((start, e, spk));
+        cursor = e;
+    }
+    merge_same(&mut turns);
+    // 吞并过短轮次：并入前一个（延伸其末端）；若是首个则并入后一个（前移其起点）。
+    let mut i = 0;
+    while turns.len() > 1 && i < turns.len() {
+        if turns[i].1 - turns[i].0 < min_turn_s {
+            if i > 0 {
+                turns[i - 1].1 = turns[i].1;
+                turns.remove(i);
+            } else {
+                turns[1].0 = turns[0].0;
+                turns.remove(0);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    merge_same(&mut turns); // 吞并可能造出相邻同人，再合一次
+    turns
+        .into_iter()
+        .map(|(s, e, spk)| {
+            let a = ((s * SR) as usize).min(total);
+            let b = ((e * SR) as usize).min(total);
+            (a, b.max(a), spk)
+        })
+        .collect()
+}
+
 
 /// 特殊标记 token（`<|zh|>` / `<|NEUTRAL|>` 等）：归属/拼接时跳过。
 fn is_special(t: &str) -> bool {
@@ -261,7 +334,7 @@ impl SpeakerRegistry {
                 best = i as i32;
             }
         }
-        if best >= 0 {
+        let result = if best >= 0 {
             let (c, cnt) = &mut self.centroids[best as usize];
             // 权重封顶：n 到 CENTROID_MAX_CNT 即止，新样本恒占 1/(cap+1) 权重（EMA），老误并可被冲淡。
             let n = (*cnt as f32).min(CENTROID_MAX_CNT);
@@ -274,7 +347,8 @@ impl SpeakerRegistry {
         } else {
             self.centroids.push((emb.to_vec(), 1));
             (self.centroids.len() - 1) as i32
-        }
+        };
+        result
     }
 
     /// 只在**已有**说话人里就近匹配（余弦 ≥ threshold），不新建、不更新质心。

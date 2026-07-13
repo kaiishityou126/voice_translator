@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use crate::denoise::{Decimator3, Denoiser};
-use crate::segmenter::{SegLimits, Segmenter};
+use crate::segmenter::{CutReason, SegLimits, Segmenter};
 
 const TARGET_RATE: usize = 16_000; // 喂给 SenseVoice
 const CAPTURE_RATE: usize = 48_000; // 采集 + 降噪工作采样率
@@ -22,7 +22,7 @@ struct Processor {
     segmenter: Segmenter,
     clean48: Vec<f32>,
     mono16: Vec<f32>,
-    segments: Vec<Vec<f32>>,
+    segments: Vec<(Vec<f32>, CutReason)>,
     vad_kind: &'static str, // "silero" / "energy"，用于上报实际生效的 VAD
 }
 
@@ -71,7 +71,7 @@ impl Processor {
     }
 
     /// 喂入 48k 单声道；切出的段经 seg_tx 发送。返回 false = 下游已断开，应停止采集。
-    fn feed(&mut self, mono48: &[f32], seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn feed(&mut self, mono48: &[f32], seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         self.clean48.clear();
         if self.denoise {
             self.denoiser.process(mono48, &mut self.clean48);
@@ -85,7 +85,7 @@ impl Processor {
     }
 
     /// 无新数据且有未收尾段时调用：强制收尾（播放停止防卡半句）。
-    fn idle_flush(&mut self, seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn idle_flush(&mut self, seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         if self.segmenter.has_open() {
             self.segmenter.flush(&mut self.segments);
         }
@@ -96,7 +96,7 @@ impl Processor {
         self.segmenter.has_open()
     }
 
-    fn drain(&mut self, seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn drain(&mut self, seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         for seg in self.segments.drain(..) {
             match seg_tx.try_send(seg) {
                 Ok(()) => {}
@@ -143,7 +143,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         init_com()?;
@@ -182,7 +182,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc = Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         // 上报实际生效的 VAD（release/安装态看不到日志，靠它在 UI 里观测）
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
         let mut mono48 = Vec::<f32>::with_capacity(CAPTURE_RATE);
@@ -366,7 +373,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         let silero_model = if use_silero {
@@ -380,8 +387,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         match source {
@@ -740,7 +753,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         let silero_model = if use_silero {
@@ -754,8 +767,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         let host = cpal::default_host();
@@ -956,7 +975,7 @@ mod platform {
         _silence_ms: u64,
         _limits: crate::segmenter::SegLimits,
         _stop: Arc<AtomicBool>,
-        _seg_tx: SyncSender<Vec<f32>>,
+        _seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         _app: tauri::AppHandle,
     ) -> Result<()> {
         let _ = source;

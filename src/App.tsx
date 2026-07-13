@@ -169,6 +169,33 @@ function App() {
   const updateRef = useRef<(next: Settings) => void>(() => {});
   // 用户是否已动过设置：防止 mount 后异步加载的存档把刚改的值盖回去
   const userTouched = useRef(false);
+  // 写盘防抖：滑块拖动会连发几十次 update，只把最后一次落盘（尾触发 300ms）。
+  // 只推迟“写文件”这一下；setSettings 与 set_target_lang/set_diarization 等实时 invoke 仍立即执行。
+  const saveTimer = useRef<number | null>(null);
+  const pendingSave = useRef<Settings | null>(null);
+  const flushSave = () => {
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    if (pendingSave.current) {
+      saveSettings(pendingSave.current);
+      pendingSave.current = null;
+    }
+  };
+  const debouncedSave = (s: Settings) => {
+    pendingSave.current = s;
+    if (saveTimer.current !== null) clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(flushSave, 300);
+  };
+  // 关窗/卸载前把未落盘的最后一次刷掉，避免 300ms 窗口内退出丢改动
+  useEffect(() => {
+    window.addEventListener("beforeunload", flushSave);
+    return () => {
+      window.removeEventListener("beforeunload", flushSave);
+      flushSave();
+    };
+  }, []);
 
   // 启动时从磁盘加载已保存的设置（异步，故不在 useState 初始化里做）
   useEffect(() => {
@@ -237,7 +264,14 @@ function App() {
       listen<SubtitleEvent>("subtitle", (e) => {
         // 同 id 回填（原文→译文），否则追加
         setSubtitles((prev) => {
-          const idx = prev.findIndex((s) => s.id === e.payload.id);
+          // 回填目标（刚发出的 id）几乎总在数组尾部，从尾向前找，避免长会议每帧 O(n) 从头扫
+          let idx = -1;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].id === e.payload.id) {
+              idx = i;
+              break;
+            }
+          }
           if (idx >= 0) {
             const next = prev.slice();
             next[idx] = e.payload;
@@ -262,6 +296,12 @@ function App() {
               ? { ...prev, out: s }
               : { ...prev, in: s }
         );
+      })
+    );
+    subs.push(
+      // 悬浮窗可见性同步：后端 toggle_overlay 隐/显时广播，悬浮窗自己 ✕ 关闭也能让主窗 PiP 按钮取消高亮
+      listen<boolean>("overlay-visibility", (e) => {
+        setOverlayOn(e.payload);
       })
     );
     subs.push(
@@ -408,7 +448,7 @@ function App() {
       invoke("set_relay_passthrough", { config: next }).catch((err) => {
         const raw = String(err);
         setSettings((s) => ({ ...s, relayPassthrough: !next.relayPassthrough }));
-        saveSettings({ ...next, relayPassthrough: !next.relayPassthrough });
+        debouncedSave({ ...next, relayPassthrough: !next.relayPassthrough });
         setStatus({
           state: "error",
           detail: raw.includes("TTS_MODEL_MISSING")
@@ -424,7 +464,7 @@ function App() {
       invoke("set_diarization", { enabled: next.diarizationEnabled }).catch(() => {});
     }
     setSettings(next);
-    saveSettings(next);
+    debouncedSave(next);
   };
   updateRef.current = update;
 
@@ -443,7 +483,7 @@ function App() {
       if (!p.isLocal && !p.apiKey.trim()) {
         setStatus({
           state: "error",
-          detail: `翻译模型「${p.label}」需要 API Key（或改用 Google 免费 / 纯字幕）`,
+          detail: `翻译模型「${p.model}」需要 API Key（或改用 Google 免费 / 纯字幕）`,
         });
         setShowSettings(true);
         return;
@@ -861,17 +901,14 @@ function App() {
 
         <div className="icon-group">
           <button
-            className={`iconbtn${settings.diarizationEnabled && settings.asrEngine !== "qwen3Asr" ? " active" : ""}`}
-            disabled={settings.asrEngine === "qwen3Asr"}
+            className={`iconbtn${settings.diarizationEnabled ? " active" : ""}`}
             onClick={() =>
               update({ ...settings, diarizationEnabled: !settings.diarizationEnabled })
             }
             data-tip={
-              settings.asrEngine === "qwen3Asr"
-                ? "Qwen 模型不支持说话人分离"
-                : settings.diarizationEnabled
-                  ? "说话人分离：开（按说话人拆分字幕）"
-                  : "说话人分离：关"
+              settings.diarizationEnabled
+                ? "说话人分离：开（按说话人拆分字幕）"
+                : "说话人分离：关"
             }
           >
             <Users size={17} strokeWidth={1.8} />

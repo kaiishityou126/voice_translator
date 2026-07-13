@@ -74,15 +74,19 @@ export interface Settings {
   voiceprintThreshold: number;
   // 说话人分离（仅入站，实验性）：把一段里不同说话人的话按 token 时间戳拆成多行并标注。可运行中开关。
   diarizationEnabled: boolean;
-  // 说话人分离聚类阈值（越大→说话人越少，抑制过分割）。默认 0.7。
-  diarizationThreshold: number;
   // 全局说话人库跨段归并阈值（越大→归并越严、同一人易裂成多号；越小→归并越松）。默认 0.55。
   speakerMergeThreshold: number;
   // 分段最大时长（秒），分引擎：SenseVoice 默认 6、Qwen3 默认 10。
   segMaxSecSensevoice: number;
   segMaxSecQwen3: number;
-  // 断句停顿时长（毫秒）：连续静音达此才断句切段。默认 500。
+  // VAD 停顿（句界，毫秒）：连续静音达此 VAD 切一句。默认 500。
   segSilenceMs: number;
+  // 句缓冲超长强制定稿（秒）：无停顿连续说到此时长强制切句。默认 25。
+  sentenceMaxS: number;
+  // 出站近场音量门（段 RMS）：仅出站，段响度低于此判为旁人/环境丢弃。默认 0.02。
+  micGateRms: number;
+  // 翻译单请求 HTTP 超时（秒）：慢的本地大模型长句可能超时，可调长。默认 30。
+  translateTimeoutS: number;
 }
 
 // 主窗口 → 悬浮窗 下发的显示配置（悬浮窗是独立窗口、读不到 Settings，靠事件同步）
@@ -369,11 +373,13 @@ export const DEFAULT_SETTINGS: Settings = {
   voiceprintGate: false,
   voiceprintThreshold: 0.5,
   diarizationEnabled: false,
-  diarizationThreshold: 0.7,
   speakerMergeThreshold: 0.55,
   segMaxSecSensevoice: 6,
   segMaxSecQwen3: 10,
   segSilenceMs: 500,
+  sentenceMaxS: 18,
+  micGateRms: 0.02,
+  translateTimeoutS: 30,
 };
 
 import { invoke } from "@tauri-apps/api/core";

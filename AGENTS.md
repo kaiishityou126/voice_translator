@@ -34,18 +34,20 @@ CI([.github/workflows/ci.yml](.github/workflows/ci.yml))在 Win/macOS/Linux 三�
 核心在 [pipeline.rs](src-tauri/src/pipeline.rs)。`pipeline::start(app, recognizer, tts, gate, direction, cfg)` 启动**一条**流水线(内部若干线程经**有界 mpsc** 串联);[lib.rs](src-tauri/src/lib.rs) 的 `start_translation` 据配置最多并发跑**两条方向相反**的流水线:
 
 ```
-入站 "in"  (听对方→字幕):  loopback 采集 → 降噪 → 重采样48k→16k → VAD分段
-   │[seg_tx,bounded=6]  → ASR识别 → 原文(pending) │[txt_tx,bounded=32] → 翻译worker×2 → 回填译文 → 写存档
+入站 "in"  (听对方→字幕):  loopback 采集 → 降噪 → 重采标40ｘ16k → VAD分段(=喂料) + voice_active活动信号
+   │[seg_tx,bounded=6]  → ASR逐段识别 → 攒句缓冲(停顿/句长定稿成整句) → 原文(pending) │[txt_tx,bounded=32] → 翻译worker×2 → 回填译文 → 写存档
 出站 "out" (你说话→译出语回灌): microphone 采集 → …同上… → 翻译 → │[tts_tx,bounded=8] → Kokoro合成 → 串行播放到 CABLE Input
 ```
 
 **关键设计**:
-- **id 回填**:全局单调递增 `NEXT_SUBTITLE_ID`(跨重启不重置)。先发 `{id, original, pending:true}` 让前端立即显示原文,翻译完按**同一 id** 回填 `{id, translated, pending:false}`。段 N+1 的识别与段 N 的翻译并行 → 实时。
+- **攒句定稿(翻译/落盘/贴标签的单元)**:断句下沉到 VAD——`segSilenceMs`(默认 750ms)是唯一停顿阈值(=句界)。VAD 给每个切出的段打 **`CutReason`标签**：**Pause**(静音达 750ms 自然切，=句界、立即定稿) / **Max**(顶到 `segMaxSec` 上限强切，=半句、继续攒)。ASR 线程按标签定稿，连续独白无停顿时靠 `sentenceMaxS` 硬兜底。定稿后经 diarize-first(pyannote 段内按人切，`split_turns` 贪心去重叠)可拆多行。另含 preroll 段边界重复碎渣过滤。参见 [docs/实时精确断句-设计方案.md](docs/实时精确断句-设计方案.md)。
+- **说话人归号**:定稿时对**整句音频**提一次 CAM++ 声纹 → `SpeakerRegistry`(见 [diarize.rs](src-tauri/src/diarize.rs))全局库就近归并,编号跨段稳定。**短句(<1s)声纹不可信 → 标未知(不归号)**,既不新建假号也不硬挂上一个人。段级声纹换人判定**已移除**(段声纹波动 ±20%,据此切句是噪声误切);换人分句改由停顿定稿承担。**已知短板**:段内**无停顿接连换人**(问答访谈第二人开头)整句归主导人,需句内 pyannote 分离才能治(储备未启用)。
+- **id 回填**:全局单调递增 `NEXT_SUBTITLE_ID`(跨重启不重置)。先发 `{id, original, pending:true}` 让前端立即显示原文,翻译完按**同一 id** 回填 `{id, translated, pending:false}`。句 N+1 的识别与句 N 的翻译并行 → 实时。
 - **代际守卫**:`PIPELINE_GEN` 自增代号丢弃旧流水线的迟到事件,避免"停止需点两次"竞态。
 - **有界通道 + 溢出丢弃**:通道满用 `try_send` 丢弃并发提示(如 `[翻译积压,已跳过]`),**绝不**改无界堆积。
 - **翻译并发**:`NUM_TRANSLATORS=2` 个 worker 抢锁消费同一 `txt_rx`,HTTP 在锁外真并发;喂 LLM 的上下文取最近 `CONTEXT_USE=2` 条**成功**译文(失败译文不进上下文,防传染)。
 - **热切目标语言**:`set_target_lang` 写 `live_target` 共享槽,翻译 worker 每段读一次,不重启流水线。
-- **出站门控(仅 out)**:`MIC_GATE_RMS=0.02` 近场音量门先粗筛远场旁人;再叠加**说话人声纹门**(见 [voiceprint.rs](src-tauri/src/voiceprint.rs)),非登记者的段直接丢。
+- **麦克风门控**:**近场音量门**(`MIC_GATE_RMS=0.02`)在**麦克风源**(回灌出站 + 麦克风翻译,即 `source=="microphone"`)按段 RMS 粗筛远场旁人/杂音——环回系统声响度天然波动大,不设门。**说话人声纹门**(见 [voiceprint.rs](src-tauri/src/voiceprint.rs))**仅回灌出站(out)**再叠一道,非登记者的段直接丢。
 - **回灌防回环**:开启回灌(`ttsEnabled && translationEngine != "none"`)时,入站强制 `source="loopback"`、出站强制 `source="microphone"`;TTS **只灌 CABLE Input**,绝不进默认输出,否则环回会把自己的 TTS 又转一遍。会议软件麦克风须选 CABLE Output。详见[设计方案](docs/语音翻译回灌会议-设计方案.md)。
 
 ## 后端模块地图(`src-tauri/src/`)
@@ -53,16 +55,16 @@ CI([.github/workflows/ci.yml](.github/workflows/ci.yml))在 Win/macOS/Linux 三�
 | 文件 | 职责 |
 |------|------|
 | [lib.rs](src-tauri/src/lib.rs) | 所有 Tauri 命令 + `AppState`(双流水线 + 双识别器,`Mutex` 保护)+ 启动清理过期存档 + 主窗关闭=干净退出 |
-| [pipeline.rs](src-tauri/src/pipeline.rs) | 单条流水线编排器(采集/识别/翻译/可选TTS线程),发 `subtitle`/`status` 事件 |
+| [pipeline.rs](src-tauri/src/pipeline.rs) | 单条流水线编排器(采集/识别/翻译/可选TTS线程);**攒句定稿**(VAD段=喂料→累积整句,voice_active 停顿定稿+句长上限)+ 整句声纹归号;发 `subtitle`/`status` 事件 |
 | [asr.rs](src-tauri/src/asr.rs) | `Asr` trait(`transcribe`/`fingerprint`/`reset_session`)+ 两实现:SenseVoice(CTC,快)/ Qwen3(LLM解码,准);进程内静态链接 sherpa-onnx,**无 sidecar/HTTP**;模型按需下载;幻觉/套话/模板泄漏熔断 |
 | [tts.rs](src-tauri/src/tts.rs) | Kokoro v1.0 多语进程内合成(复用同一份 sherpa,不引第二份 onnxruntime);模型 ~310MB 按需下载 |
 | [playback.rs](src-tauri/src/playback.rs) | WASAPI render 到输出设备(24k→48k 升采样、单声道→双声道);枚举设备 + 自动找 CABLE Input |
 | [capture.rs](src-tauri/src/capture.rs) | Windows WASAPI 环回/麦克风采集;平台无关处理抽成 `Processor`;macOS(ScreenCaptureKit)/Linux(cpal)代码已补全**待真机验证** |
 | [denoise.rs](src-tauri/src/denoise.rs) | RNNoise 降噪(480样本/帧@48k)+ /3 FIR 重采样 48k→16k |
-| [segmenter.rs](src-tauri/src/segmenter.rs) | `Vad` trait:默认 `SileroCore`(sherpa Silero VAD)/ 回退 `EnergyVad`(零依赖);`SegLimits::for_engine` 按引擎自适应段长(SenseVoice 短 / Qwen3 长);带 preroll、最短 300ms |
+| [segmenter.rs](src-tauri/src/segmenter.rs) | `Vad` trait:默认 `SileroCore`(sherpa Silero VAD)/ 回退 `EnergyVad`(零依赖);`SegLimits::for_engine` 按引擎自适应段长(SenseVoice 短 / Qwen3 长);带 preroll、最短 300ms。切出的段是**攒句喂料**,`has_open()` 经 `voice_active` 供 ASR 线程判静音 |
 | [translate.rs](src-tauri/src/translate.rs) | 多引擎:openai 兼容 / ollama / google(免费非官方)/ none;`summarize` 会话重点提炼(超预算自动 map-reduce 分块);whatlang + 假名/谚文脚本检测兜底判"译文是否还是原语种"并清上下文重译 |
 | [voiceprint.rs](src-tauri/src/voiceprint.rs) | 说话人声纹：CAM++ 嵌入（复用 sherpa）登记"我的声音" + 出站门控余弦相似度挡旁人；登记落 `voiceprint.json`；声纹提取器亦被分离的全局说话人库复用 |
-| [diarize.rs](src-tauri/src/diarize.rs) | 说话人分离（仅入站 + SenseVoice，需 token 时间戳）：`Diarizer` 用 pyannote-segmentation-3.0 做段内重叠感知分段 + CAM++ 聚类；`attribute` 逐 token 归属 + 迟滞平滑 + 最短行合并拆多行；`SpeakerRegistry` 会话级**全局说话人库**（声纹余弦就近归并+质心精炼，短段只挂不建）让编号跨段稳定；pyannote 分段模型随包打包，缺失则降级不分离 |
+| [diarize.rs](src-tauri/src/diarize.rs) | 说话人归号(仅入站)：**当前主用** `SpeakerRegistry` 会话级**全局说话人库**——定稿整句提 CAM++ 声纹,余弦就近归并+质心精炼(EMA),编号跨段稳定;`match_only` 供短句只挂不建。**储备未启用**:`Diarizer`(pyannote-segmentation-3.0 段内分段)+ `attribute`(逐 token 归属+迟滞平滑+最短行合并拆多行),用于将来治“段内无停顿接连换人”;pyannote 模型随包打包,缺失则降级 |
 | [transcript.rs](src-tauri/src/transcript.rs) | 会话译文落盘(`<stem>.jsonl`)+ 摘要(`<stem>.summary.<lang>.md`)+ 历史列举 + 过期清理 |
 | [config.rs](src-tauri/src/config.rs) | `RuntimeConfig`(serde camelCase),含语言名/TTS espeak 语种码映射 |
 | [main.rs](src-tauri/src/main.rs) | 入口,调用 `lib::run()` |
@@ -83,7 +85,7 @@ CI([.github/workflows/ci.yml](.github/workflows/ci.yml))在 Win/macOS/Linux 三�
 ## 关键约定(改代码前必读)
 
 - **camelCase 三处对齐**:改后端 `RuntimeConfig` 字段 → **必须**同步改 [types.ts](src/types.ts) 的 `Settings` + `DEFAULT_SETTINGS`,否则 IPC 静默错位。
-- **事件驱动,不轮询**:后端只 `emit`,前端 `listen<T>(...)`。字幕用 `findIndex` 命中 id 则替换、否则追加;前端只保留最近 200 条。
+- **事件驱动，不轮询**：后端只 `emit`，前端 `listen<T>(...)`。字幕用 `findIndex` 命中 id 则替换、否则追加；整场留内存（不截断），DOM 由 [SubtitleView.tsx](src/components/SubtitleView.tsx) 虚拟滚动兼底。
 - **设置持久化**:onChange → `saveSettings`(fire-and-forget,Rust 同步写 `%APPDATA%\com.seastar.voicetranslator\settings.json`);用 `userTouched` ref 防异步 `loadSettings()` 覆盖用户输入,改加载逻辑时保留此保护。
 - **错误处理**:Rust 全程 `anyhow::Result<T>` + `?`,`bail!("中文原因")` 主动报错;ASR/翻译失败 `emit_status("error", ...)` 后 `continue`,不中断流水线。面向用户文案中文,保留原始 error 供调试并给恢复提示。
 - **状态保护**:`Mutex<>` 保护 `AppState` 中的双 pipeline / 双识别器。

@@ -147,6 +147,16 @@ function WarnIcon() {
   );
 }
 
+// 显示名：同一个 model 有多条时按出现顺序编号（第 1 条=模型名，其余加 (n)），
+// 避免同模型多配置在下拉里分不清。动态计算（不落库）：删除后自动重排，不留空号。
+function modelDisplayName(p: LlmProfile, all: LlmProfile[]): string {
+  const model = p.model || "?";
+  const same = all.filter((x) => x.model === p.model);
+  if (same.length <= 1) return model;
+  const idx = same.findIndex((x) => x.id === p.id);
+  return idx <= 0 ? model : `${model}(${idx + 1})`;
+}
+
 // LLM 模型新增/编辑弹窗（自带表单状态，保存时回传整条）
 function LlmEditModal({
   initial,
@@ -161,12 +171,19 @@ function LlmEditModal({
 }) {
   const [p, setP] = useState<LlmProfile>(initial);
   const upd = (patch: Partial<LlmProfile>) => setP((prev) => ({ ...prev, ...patch }));
+  const OLLAMA_DEFAULT = "http://localhost:11434/v1";
   const setLocal = (local: boolean) =>
-    setP((prev) => ({
-      ...prev,
-      isLocal: local,
-      baseUrl: prev.baseUrl || (local ? "http://localhost:11434/v1" : ""),
-    }));
+    setP((prev) => {
+      let baseUrl = prev.baseUrl;
+      if (local) {
+        // 切本地：仅当空时补默认地址，不覆盖用户已填
+        if (!baseUrl) baseUrl = OLLAMA_DEFAULT;
+      } else if (baseUrl === OLLAMA_DEFAULT) {
+        // 切云端：若当前正好是 Ollama 默认地址则清空，露出云端 placeholder（云端无普适默认）
+        baseUrl = "";
+      }
+      return { ...prev, isLocal: local, baseUrl };
+    });
   return (
     <div className="llm-mask" onClick={(e) => e.target === e.currentTarget && onCancel()}>
       <div className="llm-modal llm-modal--narrow">
@@ -188,33 +205,29 @@ function LlmEditModal({
           </div>
         </div>
         <div className="field">
-          <label>名称（自定义，含厂商也行）</label>
-          <input value={p.label} onChange={(e) => upd({ label: e.target.value })} placeholder="如：智谱 GLM-4-Flash" />
-        </div>
-        <div className="field">
           <label>接口地址 Base URL</label>
-          <input value={p.baseUrl} onChange={(e) => upd({ baseUrl: e.target.value })} placeholder="https://open.bigmodel.cn/api/paas/v4" />
+          <input value={p.baseUrl} onChange={(e) => upd({ baseUrl: e.target.value })} placeholder="如：https://api.openai.com/v1" />
         </div>
         {!p.isLocal && (
           <div className="field">
             <label>API Key</label>
-            <input type="password" value={p.apiKey} onChange={(e) => upd({ apiKey: e.target.value })} placeholder="sk-..." />
+            <input type="password" value={p.apiKey} onChange={(e) => upd({ apiKey: e.target.value })} placeholder="如：sk-..." />
           </div>
         )}
         <div className="field">
           <label>模型名 Model</label>
-          <input value={p.model} onChange={(e) => upd({ model: e.target.value })} placeholder="glm-4-flash" />
+          <input value={p.model} onChange={(e) => upd({ model: e.target.value })} placeholder="如：gpt-4o-mini" />
         </div>
         <div className="field">
-          <label>能力（决定它出现在哪个下拉）</label>
+          <label>模型用途（决定它出现在哪个下拉）</label>
           <div className="llm-caps">
             <label className="llm-cap">
               <input type="checkbox" checked={p.capTranslation} onChange={(e) => upd({ capTranslation: e.target.checked })} />
-              可用于翻译
+              用于翻译
             </label>
             <label className="llm-cap">
               <input type="checkbox" checked={p.capSummary} onChange={(e) => upd({ capSummary: e.target.checked })} />
-              可用于提炼
+              用于提炼
             </label>
           </div>
         </div>
@@ -255,7 +268,7 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
   const transProfiles = value.llmProfiles.filter((p) => p.capTranslation);
   const sumProfiles = value.llmProfiles.filter((p) => p.capSummary);
   const profileLabel = (p: LlmProfile) =>
-    `${p.label || "未命名"}（${p.isLocal ? "Ollama" : "云端"}·${p.model || "?"}）`;
+    `${p.isLocal ? "Ollama" : "云端"}·${modelDisplayName(p, value.llmProfiles)}`;
 
   const upsertProfile = (p: LlmProfile) =>
     set({
@@ -503,51 +516,18 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       <div className="settings-divider">高级设置</div>
 
       <CollapseHead
-        title="高级选项"
+        title="进阶微调"
         open={showAdvanced}
         onToggle={() => setShowAdvanced((v) => !v)}
       />
       {showAdvanced && (
       <div className="vp-section">
       <div className="field vp-slider">
-        <label>分段最大时长 · SenseVoice {value.segMaxSecSensevoice.toFixed(0)}s</label>
+        <label>VAD·停顿（句界）{value.segSilenceMs}ms</label>
         <input
           type="range"
-          min={3}
-          max={15}
-          step={1}
-          value={value.segMaxSecSensevoice}
-          disabled={disabled}
-          onChange={(e) => set({ segMaxSecSensevoice: Number(e.target.value) })}
-        />
-      </div>
-      <div className="field vp-slider">
-        <label>分段最大时长 · Qwen3 {value.segMaxSecQwen3.toFixed(0)}s</label>
-        <input
-          type="range"
-          min={4}
-          max={15}
-          step={1}
-          value={value.segMaxSecQwen3}
-          disabled={disabled}
-          onChange={(e) => set({ segMaxSecQwen3: Number(e.target.value) })}
-        />
-      </div>
-      <InfoLine
-        detail={
-          <>
-连续说话超过此时长就<b>强制切一段</b>（只对当前所用引擎生效）。SenseVoice 是 CTC、长段易退化，默认短（6s）；Qwen3 需完整句子上下文，默认长（10s）。调短→出字更勤、延迟更低，但更容易切在句中；调长→句子更完整，但"攒一会一下子放"更明显。
-          </>
-        }
-      >
-        控制一段最长多久强制断句（影响延迟与完整度）
-      </InfoLine>
-      <div className="field vp-slider">
-        <label>断句停顿时长 {value.segSilenceMs}ms</label>
-        <input
-          type="range"
-          min={300}
-          max={1200}
+          min={400}
+          max={1500}
           step={50}
           value={value.segSilenceMs}
           disabled={disabled}
@@ -557,35 +537,56 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       <InfoLine
         detail={
           <>
-连续静音达到此时长才算<b>一句说完</b>并切段。默认 500ms。调短→更快断句、更跟得上快语，但换气短停也可能被切、句子偏碎；调长→句子更完整、少切碎，但延迟更高、也更容易把多人的话并进一段。
+说话人停顿多久算「一句说完」并断句翻译。默认 500ms。调得越小字幕出得越快、但一句可能被切碎；调得越大句子越完整、字幕出得越慢。
           </>
         }
       >
-        多长的停顿算"一句话说完"（影响断句灵敏度）
+        停顿多久算一句话说完（断句快慢）
       </InfoLine>
       <div className="field vp-slider">
-        <label>说话人分离阈值 {value.diarizationThreshold.toFixed(2)}</label>
+        <label>攒句·单句上限 {value.sentenceMaxS.toFixed(0)}s</label>
         <input
           type="range"
-          min={0.3}
-          max={0.9}
-          step={0.05}
-          value={value.diarizationThreshold}
+          min={8}
+          max={40}
+          step={1}
+          value={value.sentenceMaxS}
           disabled={disabled}
-          onChange={(e) => set({ diarizationThreshold: Number(e.target.value) })}
+          onChange={(e) => set({ sentenceMaxS: Number(e.target.value) })}
         />
       </div>
       <InfoLine
         detail={
           <>
-说话人分离的聚类阈值：<b>越大→分出的说话人越少</b>（抑制把同一人音色波动误判成新说话人），越小→越容易分出更多人。默认 0.70。分离开关在顶栏，此阈值改动在下次「开始」时生效。
+无停顿的连续说话，最多攒到这个时长就强制断句。默认 18s。调大→长独白攒得更完整，但译文更晚出；调小→更早断句、译文出得更勤，但长独白可能被从中切断。
           </>
         }
       >
-        调节「说话人分离」把一段里几个人分开的松紧
+        无停顿的连续说话上限
       </InfoLine>
       <div className="field vp-slider">
-        <label>跨段归并阈值 {value.speakerMergeThreshold.toFixed(2)}</label>
+        <label>翻译超时 {value.translateTimeoutS}s</label>
+        <input
+          type="range"
+          min={10}
+          max={120}
+          step={5}
+          value={value.translateTimeoutS}
+          disabled={disabled}
+          onChange={(e) => set({ translateTimeoutS: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+单句翻译等多久还没返回就放弃。默认 30s。用本地大模型(Ollama)且长句偶尔翻不出来、报超时，就往大调；用云端的大模型一般不用动。
+          </>
+        }
+      >
+        一句翻译最多等多久(本地大模型可调大)
+      </InfoLine>
+      <div className="field vp-slider">
+        <label>说话人·归并阈值 {value.speakerMergeThreshold.toFixed(2)}</label>
         <input
           type="range"
           min={0.3}
@@ -599,11 +600,97 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       <InfoLine
         detail={
           <>
-控制全局说话人库把<b>跨段落</b>的同一个人归到同一编号的松紧：<b>越大→归并越严</b>（要求声纹更像才算同一人，长会议里同一人易裂成「说话人1/说话人3」），越小→归并越松（更容易把两个人并成同一号）。默认 0.55。此阈值改动在下次「开始」时生效。
+开启「说话人分离」后，用来判断两段话是不是同一个人。默认 0.55。调大→认人更严：同一个人可能被拆成「说话人1」「说话人2」；调小→认人更松：两个不同的人可能被当成同一个人。遇到"一个人被拆成好几号"就往小调，"两个人混成一号"就往大调。改动在下次「开始」时生效。
           </>
         }
       >
-        调节同一个人在不同段落是否归到同一编号
+        同一个人是否被认成同一个编号
+      </InfoLine>
+      </div>
+      )}
+
+      <CollapseHead
+        title="麦克风·旁人过滤"
+        open={showVoiceprint}
+        onToggle={() => setShowVoiceprint((v) => !v)}
+      />
+      {showVoiceprint && (
+      <div className="vp-section">
+      <div className="field vp-slider">
+        <label>按音量挡旁人 {value.micGateRms.toFixed(3)}</label>
+        <input
+          type="range"
+          min={0.005}
+          max={0.05}
+          step={0.005}
+          value={value.micGateRms}
+          disabled={disabled}
+          onChange={(e) => set({ micGateRms: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+用麦克风时生效(麦克风翻译 + 回灌出站)。它<b>按响度</b>挡掉离麦克风远的旁人/杂音——离得远=声音小=判为旁人挡掉；系统声(环回)不受影响。默认 0.02。调大→挡得更严，只收近处、清晰的说话，但太小声时也可能被误挡；调小→放得更宽，收音更全，但旁边的人声/杂音更容易混进来。
+          </>
+        }
+      >
+        按音量挡掉远处旁人（麦克风翻译 + 回灌）
+      </InfoLine>
+      <label className={`toggle-row${disabled ? " is-disabled" : ""}`}>
+        <input
+          type="checkbox"
+          checked={value.voiceprintGate}
+          disabled={disabled}
+          onChange={(e) => set({ voiceprintGate: e.target.checked })}
+        />
+        <span>只识别「我的声音」，挡掉旁人（同传出站）</span>
+      </label>
+      <div className="field">
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={disabled || enrolling}
+            onClick={doEnroll}
+          >
+            {enrolling ? "录音中…" : enrolled ? "重新登记声音" : "登记我的声音"}
+          </button>
+          {enrolled && !enrolling && (
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={disabled}
+              onClick={doClearVoiceprint}
+            >
+              清除
+            </button>
+          )}
+          <span style={{ fontSize: 12, opacity: 0.75 }}>
+            {enrollMsg || (enrolled ? "已登记 ✓" : "未登记")}
+          </span>
+        </div>
+      </div>
+      <div className="field vp-slider">
+        <label>声纹相似度阈值 {value.voiceprintThreshold.toFixed(2)}</label>
+        <input
+          type="range"
+          min={0.2}
+          max={0.8}
+          step={0.05}
+          value={value.voiceprintThreshold}
+          disabled={disabled}
+          onChange={(e) => set({ voiceprintThreshold: Number(e.target.value) })}
+        />
+      </div>
+      <InfoLine
+        detail={
+          <>
+在<b>回灌·双向同传</b>时生效：出站每段声音先与你登记的声纹做对比，不像你的（旁人、别人说话）直接丢弃，不识别也不合成。需先<b>登记声音</b>并开启开关；阈值越高越严，误挡自己就调低、漏进旁人就调高（默认 0.50）。
+          </>
+        }
+      >
+        登记你的声纹后，出站只放行你本人，挡掉旁人说话
       </InfoLine>
       </div>
       )}
@@ -722,71 +809,6 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       </>
       )}
 
-      <CollapseHead
-        title="说话人门控（同传）"
-        open={showVoiceprint}
-        onToggle={() => setShowVoiceprint((v) => !v)}
-      />
-      {showVoiceprint && (
-      <div className="vp-section">
-      <label className={`toggle-row${disabled ? " is-disabled" : ""}`}>
-        <input
-          type="checkbox"
-          checked={value.voiceprintGate}
-          disabled={disabled}
-          onChange={(e) => set({ voiceprintGate: e.target.checked })}
-        />
-        <span>只识别「我的声音」，挡掉旁人（同传出站）</span>
-      </label>
-      <div className="field">
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <button
-            type="button"
-            className="btn-secondary"
-            disabled={disabled || enrolling}
-            onClick={doEnroll}
-          >
-            {enrolling ? "录音中…" : enrolled ? "重新登记声音" : "登记我的声音"}
-          </button>
-          {enrolled && !enrolling && (
-            <button
-              type="button"
-              className="btn-secondary"
-              disabled={disabled}
-              onClick={doClearVoiceprint}
-            >
-              清除
-            </button>
-          )}
-          <span style={{ fontSize: 12, opacity: 0.75 }}>
-            {enrollMsg || (enrolled ? "已登记 ✓" : "未登记")}
-          </span>
-        </div>
-      </div>
-      <div className="field vp-slider">
-        <label>相似度阈值 {value.voiceprintThreshold.toFixed(2)}</label>
-        <input
-          type="range"
-          min={0.2}
-          max={0.8}
-          step={0.05}
-          value={value.voiceprintThreshold}
-          disabled={disabled}
-          onChange={(e) => set({ voiceprintThreshold: Number(e.target.value) })}
-        />
-      </div>
-      <InfoLine
-        detail={
-          <>
-在<b>回灌·双向同传</b>时生效：出站每段声音先与你登记的声纹做对比，不像你的（旁人、别人说话）直接丢弃，不识别也不合成。需先<b>登记声音</b>并开启开关；阈值越高越严，误挡自己就调低、漏进旁人就调高（默认 0.50）。
-          </>
-        }
-      >
-        登记你的声纹后，出站只放行你本人，挡掉旁人说话
-      </InfoLine>
-      </div>
-      )}
-
       </div>
 
       {libOpen &&
@@ -830,7 +852,7 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
                   <div className="llm-row" key={p.id}>
                     <div>
                       <div className="llm-row-name">
-                        {p.label || "未命名"}
+                        {modelDisplayName(p, value.llmProfiles)}
                         <span className="llm-badge">{p.isLocal ? "Ollama" : "云端"}</span>
                       </div>
                       <div className="llm-row-sub">

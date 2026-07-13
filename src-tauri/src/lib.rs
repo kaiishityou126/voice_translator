@@ -349,7 +349,7 @@ fn enroll_voiceprint(app: AppHandle, state: State<AppState>) -> Result<(), Strin
 
     // 复用采集线程录麦克风：它已处理平台采集 + 降噪 + 重采样到 16k + VAD 切段，直接收 16k 语音段。
     let stop = Arc::new(AtomicBool::new(false));
-    let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(6);
+    let (seg_tx, seg_rx) = mpsc::sync_channel::<(Vec<f32>, segmenter::CutReason)>(6);
     let limits = segmenter::SegLimits::for_engine("senseVoice");
     let cap_stop = stop.clone();
     let cap_app = app.clone();
@@ -372,7 +372,7 @@ fn enroll_voiceprint(app: AppHandle, state: State<AppState>) -> Result<(), Strin
     let deadline = Instant::now() + Duration::from_secs(10);
     while buf.len() < 16_000 * 3 && Instant::now() < deadline {
         match seg_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(seg) => buf.extend_from_slice(&seg),
+            Ok((seg, _)) => buf.extend_from_slice(&seg),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -433,12 +433,15 @@ fn toggle_overlay(app: AppHandle) -> Result<bool, String> {
     if visible {
         w.hide().map_err(|e| e.to_string())?;
         debug_log(&app, "toggle_overlay: 已 hide");
+        // 广播可见性，让主窗同步按钮高亮（无论是主窗 PiP 还是悬浮窗 ✕ 触发）
+        let _ = app.emit("overlay-visibility", false);
         Ok(false)
     } else {
         let r = w.show();
         debug_log(&app, &format!("toggle_overlay: show 结果={:?}", r));
         r.map_err(|e| e.to_string())?;
         let _ = w.set_focus();
+        let _ = app.emit("overlay-visibility", true);
         Ok(true)
     }
 }
@@ -624,7 +627,7 @@ async fn retranslate(original: String, config: RuntimeConfig) -> Result<String, 
     // HTTP 阻塞调用放到 blocking 线程池，别卡住 async runtime
     tauri::async_runtime::spawn_blocking(move || {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(config.translate_timeout_s))
             .build()
             .map_err(|e| e.to_string())?;
         translate::translate(&client, &config, &original, &[], |_| {})
