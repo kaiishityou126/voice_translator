@@ -49,7 +49,7 @@ fn default_seg_max_qwen3() -> f32 {
 }
 
 fn default_sentence_max_s() -> f32 {
-    18.0
+    10.0
 }
 
 fn default_mic_gate_rms() -> f32 {

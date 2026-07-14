@@ -110,9 +110,11 @@ pub struct SileroCore {
     ring_cap: usize,     // 环形缓冲容量（样本数）
     fed: u64,            // 已喂入 vad 的累计样本数，与 seg.start() 同基准
     pad: usize,          // 句首前补样本数
-    // 硬上限兼底：sherpa 的 max_speech_duration 对「连续无停顿说话」不强切，段会涨到十几秒。
-    open_samples: usize,     // 当前「连续语音」累计样本数（detected() 为真时累加，否则归零）
-    max_open_samples: usize, // 超此则 flush 强制收尾一段（= silero_max_s × 16k）
+    last_end: u64,       // 上一段已发出段的绝对结尾下标；补头不得越过它，消 Max 接缝 ~200ms 重复
+    // 连续无停顿说话的硬切兜底：open_samples 数当前连续语音时长，超 max_open_samples(= silero_max_s×16k)
+    // 就 flush 硬切一段(半句/Max)并紧跟 reset 清 sherpa 内部计数器，防 circular-buffer Invalid n。
+    open_samples: usize,
+    max_open_samples: usize,
 }
 
 impl SileroCore {
@@ -148,6 +150,7 @@ impl SileroCore {
             ring_cap,
             fed: 0,
             pad,
+            last_end: 0,
             open_samples: 0,
             max_open_samples: (limits.silero_max_s * SAMPLE_RATE as f32) as usize,
         })
@@ -162,16 +165,21 @@ impl SileroCore {
             self.ring.pop_front();
         }
         self.fed += samples.len() as u64;
-        // 先取出自然结束（静音达 min_silence）的段，标 Pause（句界）。
+        // 自然停顿(min_silence)切出的段 = 句界(Pause)，立即定稿。
         self.drain(out, CutReason::Pause);
-        // 再处理上限强切：自己数连续语音时长，超 silero_max_s 就 flush 强切一段，标 Max（半句）。
-        // 自然有停顿的句子仍由 min_silence 在停顿处切(Pause)，只有连续超时才被强切(Max)。
+        // 连续无停顿：自己数时长，超 silero_max_s 就 flush 硬切一段(半句/Max)——段长与延迟都有上限。
         if self.vad.detected() {
             self.open_samples += samples.len();
             if self.open_samples >= self.max_open_samples {
                 self.vad.flush();
-                self.open_samples = 0;
                 self.drain(out, CutReason::Max);
+                // flush 中途打断会腐化 sherpa 的 CircularBuffer 计数器(负数 Invalid n)；紧跟 reset
+                // 洗回启动干净态。sherpa 内部下标归零，我们的绝对下标(fed/ring/last_end)同步归零对齐。
+                self.vad.reset();
+                self.open_samples = 0;
+                self.fed = 0;
+                self.ring.clear();
+                self.last_end = 0;
             }
         } else {
             self.open_samples = 0;
@@ -186,7 +194,10 @@ impl SileroCore {
                 // 环形缓冲里最早样本的绝对下标。
                 let ring_base = self.fed.saturating_sub(self.ring.len() as u64);
                 // 期望补头区间 [pad_start, start)，与段本身 [start, start+n) 相邻不重叠。
-                let pad_start = start.saturating_sub(self.pad as u64);
+                // 但绝不越过上一段已发出的结尾 last_end：连续说话被 Max 强切时两段无静音间隔，
+                // start-pad 会落在上一段语音尾，用 last_end 夹住可消接缝重复；有停顿的 Pause 切
+                // 因间隔 > pad，last_end 不影响其补头。
+                let pad_start = start.saturating_sub(self.pad as u64).max(self.last_end);
                 let mut seg_out = Vec::with_capacity(self.pad + samples.len());
                 if pad_start < start && pad_start >= ring_base {
                     let from = (pad_start - ring_base) as usize;
@@ -196,6 +207,8 @@ impl SileroCore {
                     }
                 }
                 seg_out.extend_from_slice(samples);
+                // 记录本段绝对结尾，供下一段补头夹逼（去接缝重复）。
+                self.last_end = start + samples.len() as u64;
                 out.push((seg_out, cut));
             }
             drop(seg);
@@ -208,7 +221,7 @@ impl SileroCore {
     }
 
     fn flush(&mut self, out: &mut Vec<(Vec<f32>, CutReason)>) {
-        // 强制把内部缓冲里残留的语音收尾成段，再取出。收尾残段当句界（Pause）。
+        // 强制把内部缓冲里残留的语音收尾成段，再取出。收尾残段当句界（Pause）立即定稿。
         self.vad.flush();
         self.drain(out, CutReason::Pause);
     }

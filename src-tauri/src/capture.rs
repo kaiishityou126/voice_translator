@@ -1,6 +1,6 @@
 //! 音频采集（按平台分发）：
-//! - Windows：WASAPI 环回(系统音频) / 默认输入(麦克风)
-//! - macOS：脚手架——ScreenCaptureKit(系统音频) / cpal(麦克风)，待在 Mac 上完成
+//! - Windows：WASAPI 环回(系统音频) / 默认输入(麦克风) —— 已验证可用
+//! - macOS：ScreenCaptureKit(系统音频) / cpal(麦克风) —— 代码完整，待真机验证
 //!
 //! 平台无关的处理（降噪 → 48k→16k 抽取 → 切段 → 有界发送）抽成 `Processor` 共享，
 //! 各平台只负责拿到「48k 单声道 f32」喂进来。

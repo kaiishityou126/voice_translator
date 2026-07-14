@@ -1,5 +1,9 @@
 # 海星同传 · SeaStar Voice Translator
 
+<p align="center">
+  <img src="app-icon.png" width="120" alt="SeaStar Voice Translator" />
+</p>
+
 **实时语音翻译桌面应用 · Real-time speech-translation desktop app**
 
 [English](#english) · [中文](#中文)
@@ -10,7 +14,7 @@
 
 Turn any sound playing on your PC — meetings, videos, live streams, podcasts — into live **bilingual subtitles**, and even speak your translation **back into a meeting**. Speech recognition runs **locally on your machine**; only the recognized **text** is sent to the translation service.
 
-> **Windows: ready to use. macOS / Linux: capture code written, pending real-hardware testing.**
+> **Windows: ready to use. macOS: capture & relay code written, pending real-hardware testing.**
 
 ### Highlights
 
@@ -28,7 +32,7 @@ Windows users who want cross-app, privacy-friendly, optionally-offline, real-tim
 
 ### System requirements (minimum)
 
-- **OS:** Windows 10 / 11 (64-bit), with the WebView2 runtime (built into Windows 11). *macOS / Linux capture code is written but unverified on real hardware, so it currently suits Windows users only.*
+- **OS:** Windows 10 / 11 (64-bit), with the WebView2 runtime (built into Windows 11). *macOS code is written but unverified on real hardware, so it currently suits Windows users only.*
 - **CPU:** x86-64 (Intel / AMD). Recognition and speech synthesis run **in real time on the CPU** — **4+ cores recommended**; for **two-way relay** (listening + speaking + synthesis at once), **6+ cores recommended**. *(Windows on ARM is not supported.)*
 - **RAM:** **8 GB+**; 16 GB recommended for the Qwen3 model or two-way relay.
 - **Disk:** about **2 GB** free for the on-demand recognition / TTS models.
@@ -93,9 +97,13 @@ Translation is done by the engine you pick; quality and speed differ here:
 
 ### Feedback & contributing
 
-Run into a problem or have an idea to make it better? Please open an [issue](../../issues). Want it on **macOS / Linux**? Speak up too — the capture code is written and just needs testing on real hardware. Knowing people actually use it is what keeps me motivated to maintain and improve this project.
+Run into a problem or have an idea to make it better? Please open an [issue](../../issues). Want it on **macOS**? Speak up too — the code is written and just needs testing on real hardware. Knowing people actually use it is what keeps me motivated to maintain and improve this project.
 
 For architecture, the module map, and dev conventions, see **[AGENTS.md](AGENTS.md)**.
+
+### License
+
+Released under the [MIT License](LICENSE).
 
 ---
 
@@ -103,7 +111,7 @@ For architecture, the module map, and dev conventions, see **[AGENTS.md](AGENTS.
 
 把电脑上正在播放的**任何声音**——会议、视频、直播、播客——变成实时**双语字幕**,甚至能把你的翻译"说"回**会议里**。语音识别**在本机完成**,只有识别出的**文本**才发往翻译服务。
 
-> **Windows:开箱可用。macOS / Linux:采集代码已写好,待真机验证。**
+> **Windows：开箱可用。macOS：代码已写好,待真机验证。**
 
 ### 特色亮点
 
@@ -121,7 +129,7 @@ Windows 用户,想要**跨应用、重隐私、可离线**地实时翻译外语�
 
 ### 系统配置(最低)
 
-- **操作系统**:Windows 10 / 11(64 位),需 WebView2 运行时(Win11 自带)。*macOS / Linux 采集代码已写好但未真机验证,暂只适合 Windows 用户。*
+- **操作系统**：Windows 10 / 11（64 位）,需 WebView2 运行时（Win11 自带）。*macOS 代码已写好但未真机验证,暂只适合 Windows 用户。*
 - **处理器**:x86-64(Intel / AMD)。识别与语音合成为**纯 CPU 实时推理** —— 建议 **4 核以上**;开**双向回灌**(同时听 + 说 + 合成三路并发)建议 **6 核以上**。*(不支持 Windows on ARM。)*
 - **内存**:**8GB 以上**;用 Qwen3 大模型或双向回灌建议 16GB。
 - **硬盘**:约 **2GB** 可用空间(按需下载的识别 / TTS 模型)。
@@ -163,6 +171,7 @@ npm run tauri build    # 打包安装包(NSIS .exe / MSI)
 本项目是**免费开源、未购买代码签名证书**的软件,首次安装系统会弹安全提示——这对任何未签名应用都一样,与软件是否安全无关。
 
 - **Windows(SmartScreen):** 点**更多信息** → **仍要运行**。
+
 ### 选哪个翻译引擎
 
 翻译由你选的引擎完成,质量与速度差别主要在这里:
@@ -177,6 +186,7 @@ npm run tauri build    # 打包安装包(NSIS .exe / MSI)
 **省钱又要实时的推荐:** 用 OpenAI 兼容接口指向**智谱 GLM-4-Flash**（免费,在[智谱开放平台](https://open.bigmodel.cn/)注册拿 key）—— 速度快,一般说完 1 秒内就出译文,日常字幕完全够用;想要更高质量再换 GPT / DeepSeek 等更强的模型。
 
 > **别选推理模型**（名字带 `o1` / `o3` / `R1` / `QwQ` / `reasoner` 的,出答案前要先“想”很久,会拖慢字幕）。直接**按模型名选个“快的”**:`Flash` / `mini` / `turbo` / `chat` / `V3`（如 GLM-4-Flash、deepseek-chat、qwen-turbo）—— 这些默认不思考,应用里填对模型名即可,无需其它设置。
+
 ### 使用小贴士
 
 - **识别语言(听懂哪些话)看引擎:** **SenseVoice**(默认、快)可识别中 / 英 / 日 / 韩 / 粤 5 种;**Qwen3-ASR**(更准)可识别约 30 种语言,另含多种中文方言。
@@ -184,6 +194,10 @@ npm run tauri build    # 打包安装包(NSIS .exe / MSI)
 
 ### 反馈与参与
 
-如果你在使用中遇到问题、或者有更好的想法,欢迎到 [Issues](../../issues) 提出来。想在 **macOS / Linux** 上用的朋友也欢迎冒个泡 —— 采集代码已经写好,只差真机调试。**有人在用,我就更有动力把这个项目持续维护、做得更好。**
+如果你在使用中遇到问题、或者有更好的想法,欢迎到 [Issues](../../issues) 提出来。想在 **macOS** 上用的朋友也欢迎冒个泡 —— 代码已经写好,只差真机调试。**有人在用,我就更有动力把这个项目持续维护、做得更好。**
 
 想了解架构、模块地图与开发约定,见 **[AGENTS.md](AGENTS.md)**。
+
+### 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。

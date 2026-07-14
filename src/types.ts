@@ -377,7 +377,7 @@ export const DEFAULT_SETTINGS: Settings = {
   segMaxSecSensevoice: 6,
   segMaxSecQwen3: 10,
   segSilenceMs: 500,
-  sentenceMaxS: 18,
+  sentenceMaxS: 10,
   micGateRms: 0.02,
   translateTimeoutS: 30,
 };

@@ -11,7 +11,7 @@
 
 实时语音翻译桌面应用:捕获系统音频(WASAPI 环回)或麦克风 → 进程内 sherpa-onnx 识别 → 云端/本地翻译 → 双语字幕 + 可选悬浮窗 + 可选 TTS 语音回灌。**隐私**:音频不出本机,只有识别后的文本发往翻译 API(配合本地 Ollama 可全程零外发)。
 
-技术栈:**Tauri 2**(Rust 后端)+ **React 19 + TypeScript**(Vite 构建)。Windows 端到端可用;macOS/Linux 采集代码已补全,**待真机验证**。
+技术栈:**Tauri 2**(Rust 后端)+ **React 19 + TypeScript**(Vite 构建)。Windows 端到端可用;macOS 采集与回灌代码完整、**待真机验证**。
 
 ## 构建与开发命令
 
@@ -59,12 +59,12 @@ CI([.github/workflows/ci.yml](.github/workflows/ci.yml))在 Win/macOS/Linux 三�
 | [asr.rs](src-tauri/src/asr.rs) | `Asr` trait(`transcribe`/`fingerprint`/`reset_session`)+ 两实现:SenseVoice(CTC,快)/ Qwen3(LLM解码,准);进程内静态链接 sherpa-onnx,**无 sidecar/HTTP**;模型按需下载;幻觉/套话/模板泄漏熔断 |
 | [tts.rs](src-tauri/src/tts.rs) | Kokoro v1.0 多语进程内合成(复用同一份 sherpa,不引第二份 onnxruntime);模型 ~310MB 按需下载 |
 | [playback.rs](src-tauri/src/playback.rs) | WASAPI render 到输出设备(24k→48k 升采样、单声道→双声道);枚举设备 + 自动找 CABLE Input |
-| [capture.rs](src-tauri/src/capture.rs) | Windows WASAPI 环回/麦克风采集;平台无关处理抽成 `Processor`;macOS(ScreenCaptureKit)/Linux(cpal)代码已补全**待真机验证** |
+| [capture.rs](src-tauri/src/capture.rs) | Windows WASAPI 环回/麦克风采集;平台无关处理抽成 `Processor`;macOS(ScreenCaptureKit)代码已补全**待真机验证** |
 | [denoise.rs](src-tauri/src/denoise.rs) | RNNoise 降噪(480样本/帧@48k)+ /3 FIR 重采样 48k→16k |
 | [segmenter.rs](src-tauri/src/segmenter.rs) | `Vad` trait:默认 `SileroCore`(sherpa Silero VAD)/ 回退 `EnergyVad`(零依赖);`SegLimits::for_engine` 按引擎自适应段长(SenseVoice 短 / Qwen3 长);带 preroll、最短 300ms。切出的段是**攒句喂料**,`has_open()` 经 `voice_active` 供 ASR 线程判静音 |
 | [translate.rs](src-tauri/src/translate.rs) | 多引擎:openai 兼容 / ollama / google(免费非官方)/ none;`summarize` 会话重点提炼(超预算自动 map-reduce 分块);whatlang + 假名/谚文脚本检测兜底判"译文是否还是原语种"并清上下文重译 |
 | [voiceprint.rs](src-tauri/src/voiceprint.rs) | 说话人声纹：CAM++ 嵌入（复用 sherpa）登记"我的声音" + 出站门控余弦相似度挡旁人；登记落 `voiceprint.json`；声纹提取器亦被分离的全局说话人库复用 |
-| [diarize.rs](src-tauri/src/diarize.rs) | 说话人归号(仅入站)：**当前主用** `SpeakerRegistry` 会话级**全局说话人库**——定稿整句提 CAM++ 声纹,余弦就近归并+质心精炼(EMA),编号跨段稳定;`match_only` 供短句只挂不建。**储备未启用**:`Diarizer`(pyannote-segmentation-3.0 段内分段)+ `attribute`(逐 token 归属+迟滞平滑+最短行合并拆多行),用于将来治“段内无停顿接连换人”;pyannote 模型随包打包,缺失则降级 |
+| [diarize.rs](src-tauri/src/diarize.rs) | 说话人归号(仅入站)：**当前主用** `SpeakerRegistry` 会话级**全局说话人库**——定稿整句提 CAM++ 声纹,余弦就近归并+质心精炼(EMA),编号跨段稳定;`match_only` 供短句只挂不建。**diarize-first(已启用)**:`Diarizer`(pyannote-segmentation-3.0 段内分段)+ `split_turns`(贪心去重叠)在入站开启「说话人分离」且块够长时按人切音频、逐轮重识别、多行出;`attribute`/`speaker_at`(逐 token 归属+迟滞平滑)仍为储备。pyannote 模型随包打包,缺失则降级 |
 | [transcript.rs](src-tauri/src/transcript.rs) | 会话译文落盘(`<stem>.jsonl`)+ 摘要(`<stem>.summary.<lang>.md`)+ 历史列举 + 过期清理 |
 | [config.rs](src-tauri/src/config.rs) | `RuntimeConfig`(serde camelCase),含语言名/TTS espeak 语种码映射 |
 | [main.rs](src-tauri/src/main.rs) | 入口,调用 `lib::run()` |
@@ -124,6 +124,6 @@ CI([.github/workflows/ci.yml](.github/workflows/ci.yml))在 Win/macOS/Linux 三�
 
 - Google 引擎为非官方接口,可能被限流。
 - 目标语言 = 源语言时(如 `targetLang=ja` 又听日语音频),译文=原文属**配置**问题非 bug——`translate.rs` 判定"原文本就是目标语"会故意放行不重译。
-- macOS/Linux 采集仅编译过,未真机验证(权限弹窗时机、设备选择、出声均需真机)。
+- macOS 采集+回灌代码完整但仅编译过、未真机验证(权限弹窗时机、设备选择、出声均需真机)。
 
 > 提交规范:Conventional Commits(`type(scope): subject`),推 `main` 分支需二次确认,详见用户全局 CLAUDE.md。

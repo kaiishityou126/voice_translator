@@ -1,4 +1,4 @@
-//! 说话人分离（实验版：仅加载 + 埋点，不拆段、不改字幕）。
+//! 说话人分离：为入站「攒句定稿」提供段内按人切分（diarize-first）。
 //!
 //! 复用 sherpa-onnx 的 `OfflineSpeakerDiarization`：
 //!   pyannote-segmentation-3.0（随安装包打包，见 tauri.conf.json bundle.resources）做局部重叠感知分段，
@@ -6,8 +6,9 @@
 //!   + FastClustering（num_clusters=-1 自动定人数）聚类。
 //! 段模型缺失时 `load` 返回 Err，调用方静默降级为「不分离」。
 //!
-//! 注：攒句方案已改为「整句贴标签」（仅用 SpeakerRegistry）；pyannote 段内切分
-//! （Diarizer/attribute/speaker_at 等）暂不使用但保留以备将来句内切分，故压制其 dead_code 告警。
+//! 注：`Diarizer::load` / `process` / `split_turns` 已被 pipeline 的 diarize-first 采用
+//! （入站 + 开启「说话人分离」+ 块够长时按人切音频、逐轮重识别、多行出）；`attribute` / `speaker_at`
+//! 等逐 token 归属辅助暂未接线、保留备用，故压制其 dead_code 告警。
 #![allow(dead_code)]
 
 use std::path::PathBuf;

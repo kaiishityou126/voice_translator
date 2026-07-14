@@ -181,19 +181,7 @@ pub fn start(
                         if speed > 1.0 {
                             eprintln!("[tts] 积压 {:.1}s → 语速 {:.2}", waited.as_secs_f32(), speed);
                         }
-                        // 崩溃取证埋点：Kokoro/espeak 若在合成内抛外部异常会直接 abort。
-                        // 先把即将合成的文本(带 {:?} 转义，暴露控制字符/乱码/超长)打到 stderr(无缓冲)并 flush，
-                        // abort 后这行即最后线索。定位完删除。
-                        eprintln!(
-                            "[tts] →synth len={} sid={} speed={:.2} text={:?}",
-                            text.chars().count(),
-                            sid,
-                            speed,
-                            text
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
                         let pcm = synth.synth(&text, sid, speed);
-                        eprintln!("[tts] ←synth 样本={}", pcm.len());
                         if let Err(e) = player.play(&pcm) {
                             emit_status(
                                 &app_tts,
