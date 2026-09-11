@@ -246,10 +246,23 @@ pub fn start(
         }
     });
 
+    // 本会话存档写入器（识别线程与翻译 worker 共享，逐段追加）；write_transcript=false（如回灌出站）时为 None。
+    // 上提到识别线程之前创建：纯字幕模式不走翻译 worker，需由识别线程直接落盘原文。
+    let session_writer = if cfg.write_transcript {
+        crate::transcript::transcripts_dir(&app).map(|d| {
+            let stem = crate::transcript::session_stem_now();
+            Arc::new(crate::transcript::SessionWriter::new(d.join(format!("{stem}.jsonl"))))
+        })
+    } else {
+        None
+    };
+
     // ---- 识别线程（本地 SenseVoice，进程内）----
     let stop_asr = stop.clone();
     let app_asr = app.clone();
     let engine = cfg.translation_engine.clone();
+    // 纯字幕（engine=="none"）落盘用：翻译 worker 不参与，由识别线程写原文。
+    let asr_writer = session_writer.clone();
     let asr_engine = recognizer;
     let dir_asr = dir.clone();
     // 说话人分离（仅入站）：开关热切读它；整句贴标签用声纹提取器（惰性加载、复用 CAM++）。
@@ -334,7 +347,11 @@ pub fn start(
         // 出一行字幕（原文即时显示 + 送翻译；none 引擎只出原文终态）。
         let emit_line = |id: u64, text: String, speaker: Option<i32>| {
             if engine == "none" {
-                emit_orig(id, text, speaker, false);
+                emit_orig(id, text.clone(), speaker, false);
+                // 纯字幕直接落盘：原文入档、译文空串（翻译 worker 不经手这条路径）。
+                if let Some(w) = &asr_writer {
+                    w.append(id, now_ms(), &text, "", speaker);
+                }
             } else {
                 emit_orig(id, text.clone(), speaker, true);
                 send_tr(id, text, speaker);
@@ -612,16 +629,6 @@ pub fn start(
     let txt_rx = Arc::new(Mutex::new(txt_rx)); // 单生产者多消费者：worker 抢锁 try_recv
     // 已完成翻译的最近历史 (id, 原文, 译文)，作为 LLM 上下文；并发下按完成序近似，实时场景足够
     let history = Arc::new(Mutex::new(VecDeque::<(u64, String, String)>::new()));
-    // 本会话译文落盘写入器（多 worker 共享，成功译文逐段追加）；纯字幕/出站不写
-    let session_writer = if cfg.write_transcript {
-        crate::transcript::transcripts_dir(&app).map(|d| {
-            let stem = crate::transcript::session_stem_now();
-            Arc::new(crate::transcript::SessionWriter::new(d.join(format!("{stem}.jsonl"))))
-        })
-    } else {
-        None
-    };
-
     for _ in 0..NUM_TRANSLATORS {
         let stop_tr = stop.clone();
         let app_tr = app.clone();
