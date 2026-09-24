@@ -1191,6 +1191,25 @@ body {
   }
 }
 
+/* 左边缘拖拽条：按住往左拖加宽面板。必须完全处于面板内，否则会触发「点面板外关闭」 */
+.summary-resizer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 6px;
+  z-index: 2;
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.summary-resizer:hover,
+.summary-resizer:active {
+  background: var(--accent);
+  opacity: 0.3;
+}
+
 .summary-head {
   display: flex;
   align-items: center;
@@ -1256,9 +1275,113 @@ body {
   margin-top: 0;
 }
 
+/* 模型若没按要求用了三级标题，在这里拉齐成与圆点条目一致的样子 */
+.summary-body .md-alt-li {
+  margin: 0 0 6px;
+  padding-left: 17px;
+  text-indent: -17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.summary-body .md-alt-li::before {
+  content: "• ";
+}
+
+/* 紧跟其后的说明段落与条目正文对齐 */
+.summary-body .md-alt-li + p {
+  margin: 0 0 8px;
+  padding-left: 17px;
+}
+
 .summary-li {
   margin: 0 0 7px;
   padding-left: 2px;
+}
+
+/* 以下为提炼完成后的 Markdown 渲染元素（标题仍复用上面的 .summary-body h4） */
+.summary-body p {
+  margin: 0 0 8px;
+}
+
+.summary-body ul,
+.summary-body ol {
+  margin: 0 0 8px;
+  padding-left: 17px;
+}
+
+.summary-body li {
+  margin: 0 0 6px;
+}
+
+.summary-body strong {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.summary-body a {
+  color: var(--accent);
+}
+
+.summary-body code {
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.92em;
+  background: rgba(128, 128, 128, 0.14);
+  border-radius: 4px;
+}
+
+.summary-body pre {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: rgba(128, 128, 128, 0.1);
+  border-radius: 6px;
+}
+
+.summary-body pre code {
+  padding: 0;
+  background: none;
+}
+
+.summary-body blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-dim);
+}
+
+.summary-body hr {
+  margin: 14px 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+/* 表格列多时在容器内横向滚动，不撑破窄面板 */
+.summary-table-wrap {
+  margin: 0 0 10px;
+  overflow-x: auto;
+}
+
+.summary-body table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.summary-body th,
+.summary-body td {
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+  border: 1px solid var(--border);
+}
+
+.summary-body th {
+  font-weight: 700;
+  color: var(--text);
+  background: rgba(128, 128, 128, 0.09);
 }
 
 .summary-loading {
@@ -1933,6 +2056,9 @@ body {
   align-items: center;
   gap: 6px;
 }
+.llm-row-main {
+  min-width: 0;
+}
 .llm-badge {
   font-size: 10px;
   font-weight: 600;
@@ -1948,6 +2074,13 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.llm-row-url {
+  font-size: 11px;
+  color: var(--hint);
+  line-height: 1.35;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
 }
 .llm-caps {
   display: flex;

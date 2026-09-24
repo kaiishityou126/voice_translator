@@ -357,7 +357,7 @@ export const DEFAULT_SETTINGS: Settings = {
   summaryLlmId: "",
   transcriptKeepDays: 10,
   summaryKeepDays: 0,
-  summaryMaxContext: 10000,
+  summaryMaxContext: 30000,
   theme: "system",
   subtitleScale: "sm",
   displayMode: "bilingual",

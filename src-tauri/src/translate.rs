@@ -193,7 +193,7 @@ fn chat_once(
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
-    stream_chat(req, on_chunk)
+    Ok(stream_chat(req, on_chunk)?.text)
 }
 
 /// GLM 系列默认开思维链，内容会进 reasoning_content 导致 content 为空；对 glm 模型显式关掉。
@@ -210,10 +210,20 @@ fn glm_disable_thinking(body: &mut serde_json::Value, model: &str) {
 /// 只显示/返回「正文」：正文里的 `<think>…</think>` 被剥掉;思考走独立的
 /// `reasoning_content` 字段时不显示，仅当正文全空才用它兜底（某些模型把答案塞进了 reasoning）。
 /// 翻译与摘要共用这套 SSE 解析。
+/// 一次流式请求的结果。除正文外还带上「流是怎么结束的」，
+/// 因为 SSE 被中途掐断时正文仍是半截却不报错，只看正文分辨不出来。
+struct StreamOutcome {
+    text: String,
+    /// 收到过 `[DONE]` 或非空 finish_reason，即服务端明确告知已写完。
+    finished_cleanly: bool,
+    /// finish_reason == "length"：顶到 max_tokens 被砍，同参数重试必然同样被砍。
+    length_capped: bool,
+}
+
 fn stream_chat(
     req: reqwest::blocking::RequestBuilder,
     on_chunk: &mut dyn FnMut(&str),
-) -> Result<String> {
+) -> Result<StreamOutcome> {
     let resp = req.send()?;
     let status = resp.status();
     if !status.is_success() {
@@ -231,6 +241,8 @@ fn stream_chat(
     let mut content = String::new(); // 正文累计（可能内联 <think>）
     let mut reasoning = String::new(); // 思考链累计（不显示，正文全空时才兜底）
     let mut shown = String::new(); // 上次推给前端的显示串，避免重复推
+    let mut finished_cleanly = false;
+    let mut length_capped = false;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -246,6 +258,7 @@ fn stream_chat(
             None => continue, // 非 data 行（注释/event）跳过
         };
         if data == "[DONE]" {
+            finished_cleanly = true;
             break;
         }
         // 容错：半行/坏 json 跳过，不中断整个流
@@ -253,6 +266,10 @@ fn stream_chat(
             Ok(v) => v,
             Err(_) => continue,
         };
+        if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+            finished_cleanly = true;
+            length_capped = fr == "length";
+        }
         let delta = &v["choices"][0]["delta"];
         let mut grew = false;
         if let Some(c) = delta["content"].as_str() {
@@ -288,7 +305,11 @@ fn stream_chat(
     if out.is_empty() {
         bail!("LLM 返回空内容");
     }
-    Ok(out)
+    Ok(StreamOutcome {
+        text: out,
+        finished_cleanly,
+        length_capped,
+    })
 }
 
 /// 按 id 在模型库找一条 → (base_url, api_key，本地 Ollama 无需 key 返回空串, model)。找不到 None。
@@ -320,6 +341,21 @@ fn summary_endpoint(cfg: &RuntimeConfig) -> Result<(&str, &str, &str)> {
     match profile_endpoint(cfg, &cfg.translation_llm_id) {
         Some(e) => Ok(e),
         None => bail!("未选择提炼模型，请在设置里选择提炼模型或先配置翻译模型"),
+    }
+}
+
+/// 分段要点的属性标记词（map 打标、reduce 据此分派小节）。
+/// 必须随目标语言本地化，否则会往目标语纪要里混入其他语言，违反输出语言铁律。
+fn summary_tags(target_lang: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    match target_lang {
+        "en" => ("Decision", "Action", "Open", "Discussion"),
+        "ja" => ("決定", "対応", "未決", "議論"),
+        "ko" => ("결정", "실행", "미결", "논의"),
+        "fr" => ("Décision", "Action", "Ouvert", "Discussion"),
+        "es" => ("Decisión", "Acción", "Abierto", "Discusión"),
+        "de" => ("Entscheidung", "Aufgabe", "Offen", "Diskussion"),
+        "ru" => ("Решение", "Задача", "Открыто", "Обсуждение"),
+        _ => ("决定", "待办", "未决", "讨论"),
     }
 }
 
@@ -383,7 +419,8 @@ pub fn summarize(
         let mut cb = |acc: &str| on_chunk(&format!("{}{}", header, acc));
         let p = summarize_map_chunk(client, cfg, ch, &mut cb)?;
         on_stage(&format!("map {}/{} done（{} 字）", i + 1, m, p.chars().count()));
-        partials.push(format!("# 片段 {}\n{}", i + 1, p.trim()));
+        // 不用 `# ` 标题：reduce 的格式铁律只允许 `## `，输入里出现其他标题会带歪模型
+        partials.push(format!("〔片段 {}〕\n{}", i + 1, p.trim()));
     }
     // 分层折叠（collapse）：各片段要点拼起来若仍超预算，先分组递归折叠到装得下，
     // 再做最终 reduce——避免 reduce 一次性硬压把次要议题丢掉。
@@ -411,9 +448,17 @@ pub fn summarize(
         combined = folded.join("\n\n");
     }
     on_stage(&format!("reduce：合并 {} 字生成最终纪要", combined.chars().count()));
-    let desc = "下面是把一段内容分段提炼后的要点清单（按片段顺序排列，可能有重叠或重复）。\
-                请按话题聚类、去重、归纳成最终纪要；有名有姓有数字的话题保留，零碎无名口水可省略。";
-    summarize_structured(client, cfg, &combined, desc, &mut on_chunk)
+    // 分段要点带 [标记]，这里告诉 reduce 怎么用它分派小节，并明确禁止把标记写进最终纪要
+    let (t_decision, t_action, t_open, t_talk) = summary_tags(&cfg.target_lang);
+    let desc = format!(
+        "下面是把一段内容分段提炼后的要点清单（按片段顺序排列，可能有重叠或重复）。\
+         每条开头方括号里的 [{t_decision}] / [{t_action}] / [{t_open}] / [{t_talk}] 是分段时标注的属性，\
+         请据此把该条内容分派到下面结构中对应的小节；标记只作线索，与内容明显不符时以内容为准。\
+         **不要把方括号标记本身写进最终输出。**\
+         〔片段 N〕只是内部分段标记，**输出里不许提及片段编号或分段处理过程**，读者只该看到一份完整纪要。\
+         请按话题聚类、去重、归纳成最终纪要（取舍与写法一律按下面的规则）。"
+    );
+    summarize_structured(client, cfg, &combined, &desc, &mut on_chunk)
 }
 
 /// 结构化提炼（reduce / 单次共用）：`input_desc` 说明输入是原始记录还是分段要点。
@@ -426,8 +471,17 @@ fn summarize_structured(
 ) -> Result<String> {
     let (base_url, api_key, model) = summary_endpoint(cfg)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    // 小节标题与「无」字样随目标语言本地化，保证整篇摘要（含结构骨架）都用目标语言
-    let (lang_native, h_overview, h_points, h_decisions, h_actions, h_followup, none_word) =
+    // 小节标题与「无」「未知」字样随目标语言本地化，保证整篇摘要（含结构骨架）都用目标语言
+    let (
+        lang_native,
+        h_overview,
+        h_points,
+        h_decisions,
+        h_actions,
+        h_followup,
+        none_word,
+        unknown_word,
+    ) =
         match cfg.target_lang.as_str() {
             "en" => (
                 "English",
@@ -437,6 +491,7 @@ fn summarize_structured(
                 "Action Items",
                 "Follow-ups / Open Questions",
                 "None",
+                "Unknown",
             ),
             "ja" => (
                 "日本語",
@@ -446,6 +501,7 @@ fn summarize_structured(
                 "アクションアイテム",
                 "フォローアップ / 未決事項",
                 "なし",
+                "不明",
             ),
             "ko" => (
                 "한국어",
@@ -455,6 +511,7 @@ fn summarize_structured(
                 "액션 아이템",
                 "후속 조치 / 미결 사항",
                 "없음",
+                "미정",
             ),
             "fr" => (
                 "Français",
@@ -464,6 +521,7 @@ fn summarize_structured(
                 "Actions à mener",
                 "Suivi / Questions ouvertes",
                 "Aucun",
+                "Inconnu",
             ),
             "es" => (
                 "Español",
@@ -473,6 +531,7 @@ fn summarize_structured(
                 "Acciones",
                 "Seguimiento / Pendientes",
                 "Ninguno",
+                "Desconocido",
             ),
             "de" => (
                 "Deutsch",
@@ -482,6 +541,7 @@ fn summarize_structured(
                 "Aufgaben",
                 "Offene Punkte",
                 "Keine",
+                "Unbekannt",
             ),
             "ru" => (
                 "Русский",
@@ -491,6 +551,7 @@ fn summarize_structured(
                 "Задачи",
                 "Незакрытые вопросы",
                 "Нет",
+                "Неизвестно",
             ),
             _ => (
                 "简体中文",
@@ -500,23 +561,43 @@ fn summarize_structured(
                 "行动项",
                 "待跟进 / 未决问题",
                 "无",
+                "未知",
             ),
         };
     let system = format!(
         "【输出语言强制要求】整篇回答必须 100% 用 {lang_native} 书写——包括所有小节标题、要点正文、关键词、说明文字，一个字都不许用其他语言（哪怕原始记录是别的语言）。\
          如果你用了 {lang_native} 以外的语言，就是错误输出。\n\n\
-         你在分析一段录音/记录，先判断这是什么内容（视频会议、新闻、音乐、访谈、讲座、广播等）。{input_desc}\
-         请用「{lang_native}」整理成分析型纪要：唱歌、歌词、语气词、寒暄、口水话只一句带过，但事件、事实、数字、金额、时间、人名都要保留。\
-         归类铁律：把同一话题归到一条，按主题聚成 5-10 条要点，每条几句话归纳该话题、不要逐条搬运原句、不要把不同话题塞进同一条。\
-         取舍：有名有姓、有数字的话题（如人名/案件/台风/赛事/汇率）必须保留；没人名没数字的零碎口水（如「某人决定加油」）可省略或一句带过。\
+         你在分析一段录音/记录，先判断这是什么内容（会议、访谈、讲座、新闻、节目等）。{input_desc}\
+         请用「{lang_native}」整理成分析型纪要。\n\
+         【最重要的一条：每条都要有干货】每条都必须让**没听过原内容的人直接读懂具体内容**，而不是只知道「讲过这个话题」。\
+         写完每条自检一遍：读者看完这句，能知道结论、做法或数据是什么吗？不能就是不合格，回去把具体内容补上。\n\
+         ❌「比较了 go 和 push 的区别」→ 读者仍不知道区别是什么\n\
+         ✅「**go / push**：go 在目标页已在栈中时直接跳转、不新建；push 每次压栈、总是开新页」\n\
+         ❌「讨论了各项目进度」→ 读者仍不知道进度如何\n\
+         ✅「**订单确认模块**：主流程已完成，退款分支待联调」\n\
+         「介绍了 / 讲解了 / 讨论了 / 提到了 / 说明了 / 分析了」这类只说「讲过」的写法一律不合格。\
+         但**原内容本身就没讲清楚的，如实写「仅提及、未展开」，绝不许编造具体内容来凑**。\n\
+         【取舍】看有没有结论或信息价值，不看有没有出现人名或数字；语气词、寒暄、无信息的闲聊一律略过或合并成一句带过。\
+         同一话题归到一条，按主题聚类；**有几个话题就写几条**，不为凑数注水，也不为压缩条数丢掉真实话题；\
          切勿仅因两段共用某个词就把不同话题合并，不确定时宁可拆开。\
-         每条要点是一个话题的小结，可多句：发生了什么、关键事实与数字，关键词用 Markdown 加粗，不同要点别重复同一件事。\
-         严格按以下 Markdown 结构输出（标题与正文一律用 {lang_native}，层级不变）：\n\
-         ## {h_overview}\n（2-3 句：这是什么内容、整体讲了什么，点到主要话题）\n\
-         ## {h_points}\n- 每个话题一条「**关键词**：几句归纳」，按主题聚类，不流水账、不重复\n\
-         ## {h_decisions}\n- 已拍板的结论；没有就写「{none_word}」\n\
-         ## {h_actions}\n- 待办，尽量标负责人和时间；没有就写「{none_word}」\n\
-         ## {h_followup}\n- 悬而未决、需确认的点；没有就写「{none_word}」\n\
+         关键词用 Markdown 加粗；数字（时间、金额、数量、名称）原样保留；「为什么」只在该结论有争议或反直觉时补一句。\n\
+         【识别误差】语音识别常把专有名词（技术名词、人名、机构名）听成同音词。上下文能明确判断出正确写法的就按正确的写，\
+         拿不准的原样保留，**绝不臆造**。\n\
+         【单向内容】若这段是单向讲授或播报（课程、讲座、新闻、节目，没有多人协商拍板），\
+         那「{h_decisions}」「{h_actions}」「{h_followup}」多半本来就没有，**如实写「{none_word}」，绝不为填满而编**，\
+         把力气全放在「{h_points}」每条的具体内容上。\n\
+         【格式铁律】整篇**只允许两种标记**：小节标题用 `## `，其余内容一律写成条目「- **关键词**：内容」。\
+         **禁止三级及以下标题（###）、禁止表格、禁止代码块围栏、小节标题里不要加 emoji 或任何符号。**\
+         每个条目必须是一整条「- **关键词**：内容」，内容可以写长，但**不许拆成标题加正文两行**。\n\
+         严格按以下 Markdown 结构输出（标题与正文一律用 {lang_native}，层级与顺序都不许变）：\n\
+         ## {h_overview}\n（这一节是 2-3 句连续文字，不用条目：这是什么内容、整体讲了什么、最重要的结论或信息是什么。**不要把下面各条的关键词罗列一遍**）\n\
+         ## {h_decisions}\n- **关键词**：已拍板的结论。新闻/讲座里转述的「某机构决定了什么」属于内容本身，写进「{h_points}」而不是这里；没有就写「{none_word}」\n\
+         ## {h_actions}\n- **负责人**：要做的事，一条一件。只写记录中**有人明确承诺要做、或被明确指派去做**的事；\
+         **绝不要把内容本身改写成任务**——播报了暴雨预警不等于有人被指派去监测天气。\
+         只有记录里明确把这件事交给某人时才写负责人（句中提到某人名字不算，如「张三上次说这方案不行」里张三不是负责人），\
+         期限只写记录中明说的；明显该有人负责却没指明的，负责人位置写「{unknown_word}」；没有就写「{none_word}」\n\
+         ## {h_points}\n- **关键词**：该话题的结论、做法与关键数据。按主题聚类，不同条目别重复同一件事\n\
+         ## {h_followup}\n- **关键词**：悬而未决、需确认的点；没有就写「{none_word}」\n\
          不要逐句翻译，不要编造记录中没有的信息。再次强调：最终输出从头到尾只能是 {lang_native}。",
     );
     let messages = vec![
@@ -527,16 +608,54 @@ fn summarize_structured(
         "model": model,
         "temperature": 0.45,
         // 反重复：reduce 输入已是去重要点，重复风险低；temperature 略提到 0.45 兼顾稳定结构与表达，
-        // penalty 对支持的模型生效、GLM 忽略无害，max_tokens 给较大上限避免最终纪要小节被截断
+        // penalty 对支持的模型生效、GLM 忽略无害。要点条数不再设 5-10 上限，max_tokens 随之抬高防截断
         "frequency_penalty": 0.3,
         "presence_penalty": 0.2,
-        "max_tokens": 3000,
+        "max_tokens": 4000,
         "stream": true,
         "messages": messages
     });
     glm_disable_thinking(&mut body, model);
-    let raw = stream_chat_retry(client, &url, api_key, &body, on_chunk)?;
-    Ok(strip_degenerate_tail(&strip_think(&raw)))
+    // 流被中断（网络抖动 / 服务端提前关连接）时 stream_chat 会把半截内容当成功返回，摘要少写几节却不报错。
+    // 用 finished_cleanly 区分「真被掐断」与「模型本来就只写这么多」，只对前者重试——
+    // 后者和顶到 max_tokens 的情况，同参数重试只会得到同样的结果，白等一轮。
+    const EXPECTED_SECTIONS: usize = 5; // 与上面 prompt 里的小节数一致
+    const MAX_TRIES: usize = 2;
+    let mut best = String::new();
+    let mut best_sections = 0usize;
+    let mut best_is_last = true;
+    for attempt in 1..=MAX_TRIES {
+        let o = stream_chat_retry(client, &url, api_key, &body, on_chunk)?;
+        let out = strip_degenerate_tail(&strip_think(&o.text));
+        let n = md_section_count(&out);
+        // 始终留住小节最全的一次，避免重试拿到更差的结果反而把好的覆盖掉
+        if attempt == 1 || n > best_sections {
+            best_sections = n;
+            best = out;
+            best_is_last = true;
+        } else {
+            best_is_last = false;
+        }
+        if n >= EXPECTED_SECTIONS || o.finished_cleanly || o.length_capped || attempt == MAX_TRIES {
+            break;
+        }
+        on_chunk(&format!(
+            "⏳ 摘要生成被中断（只写出 {} 个小节），正在重新生成…",
+            n
+        ));
+    }
+    // 采用的不是最后一次时，前端停在后一次（更差）的画面上，补推一次保持与存档一致
+    if !best_is_last {
+        on_chunk(&best);
+    }
+    Ok(best)
+}
+
+/// 统计 Markdown 顶层小节（`## `）数量；`###` 等更深层级不计入。
+fn md_section_count(text: &str) -> usize {
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("## "))
+        .count()
 }
 
 /// map 阶段：把一个片段提炼成简洁要点 bullet 列表（不出小节标题），整段收齐后返回。
@@ -549,13 +668,23 @@ fn summarize_map_chunk(
     let (base_url, api_key, model) = summary_endpoint(cfg)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let lang_native = target_lang_native(cfg);
+    let (t_decision, t_action, t_open, t_talk) = summary_tags(&cfg.target_lang);
     let system = format!(
         "下面是一段实时转录记录的一个片段（[原] 原文 / [译] 译文，多为目标语译文；部分段翻译失败仅有源语原文、可能多语种混杂，识别也可能有误、有口语冗余；也可能本身已是上一轮要点）。\
-         用「{lang_native}」先把内容归到几个话题，每个话题一条要点：事件、事实、数字、人名、明确话题。\
-         唱歌、歌词、语气词、寒暄、口水话只合并成一句带过（如「演唱了《X》等歌曲」），没信息的不列。\
-         无名无实的零碎情节（如「某人决定加油」「某人向某人求救」这种没人名没数字的口水）不要单列，归不进话题就丢掉。\
-         有名有姓、有数字（金额、票数、年份、时间、人数、幅度）的话题必留并原样保留数字；别为凑词把不同话题硬合并。\
-         每条「- **话题**：一句概括」，抓主干、不逐句复述，雷同只留一条。\
+         用「{lang_native}」把内容归到几个话题，每个话题一条要点。\
+         每条格式：「- [标记] **话题**：归纳」。\
+         标记从这四个中选一个：[{t_decision}]=本次记录中当场拍板的结论、[{t_action}]=有人明确承诺要做或被明确指派的事、\
+         [{t_open}]=讨论了但没结论、[{t_talk}]=其余内容（讲授、播报、说明等一律用这个）；拿不准就用 [{t_talk}]。\
+         **不要把内容本身改写成任务**——播报了暴雨预警不等于有人要去监测天气。\
+         若输入的某条本身已带方括号标记，原样保留该标记。\
+         归纳写 1-3 句，必须让**没听过原内容的人直接读懂具体内容**——后续汇总只能看到你这里写下的东西，\
+         写成「介绍了X」「讨论了Y」等于把内容丢了。\n\
+         ❌「比较了 go 和 push 的区别」  ✅「go 在目标页已在栈中时直接跳转不新建；push 每次压栈总是开新页」\n\
+         结论、各方立场、理由、前提条件、分歧，以及具体事实与数字（时间、金额、数量、名称）都要写进去并原样保留数字。\
+         **原内容本身就没讲清楚的，如实写「仅提及、未展开」，绝不许编造细节来凑。**\
+         语音识别常把专有名词听成同音词，上下文能明确判断的按正确写法写，拿不准的原样保留、绝不臆造。\
+         取舍看有没有结论或信息价值，不看有没有出现人名或数字；语气词、寒暄、无信息的闲聊合并成一句带过或直接丢掉。\
+         别为凑词把不同话题硬合并，雷同只留一条。\
          只输出 bullet，不要标题、不要开场白和总结套话。整段只能用 {lang_native}。",
     );
     let messages = vec![
@@ -566,17 +695,32 @@ fn summarize_map_chunk(
         "model": model,
         "temperature": 0.6,
         // 反重复：map 直接吃原始转录、重复短语多；temperature 提到 0.6 打破贪婪解码循环，
-        // penalty 对支持的模型（OpenAI/Ollama）生效、GLM 等不支持的会忽略也无害，max_tokens 兜底防刷屏
+        // penalty 对支持的模型（OpenAI/Ollama）生效、GLM 等不支持的会忽略也无害。
+        // 每条要点从「一句概括」放宽到 1-3 句带细节，max_tokens 随之抬高，防要点写到一半被截断
         "frequency_penalty": 0.4,
         "presence_penalty": 0.3,
-        "max_tokens": 1500,
+        "max_tokens": 2500,
         "stream": true,
         "messages": messages
     });
     glm_disable_thinking(&mut body, model);
-    // 模型无关兼底：不依赖 penalty（GLM 不支持），落地前先切掉退化鬼打墙的尾巴、再折叠完全重复的 bullet，防退化刷屏污染下游
-    let raw = stream_chat_retry(client, &url, api_key, &body, on_chunk)?;
-    Ok(dedup_lines(&strip_degenerate_tail(&strip_think(&raw))))
+    // 这一段被掐断的话，丢掉的要点 reduce 无从补回、且全程不会报错，所以必须在这里拦住。
+    // map 输出是平铺 bullet、没有小节结构可校验，只能靠 finished_cleanly 判断，并取更长的一份。
+    const MAX_TRIES: usize = 2;
+    let mut best = String::new();
+    for attempt in 1..=MAX_TRIES {
+        let o = stream_chat_retry(client, &url, api_key, &body, on_chunk)?;
+        // 模型无关兼底：不依赖 penalty（GLM 不支持），落地前先切掉退化鬼打墙的尾巴、再折叠完全重复的 bullet，防退化刷屏污染下游
+        let out = dedup_lines(&strip_degenerate_tail(&strip_think(&o.text)));
+        if out.chars().count() > best.chars().count() {
+            best = out;
+        }
+        if o.finished_cleanly || o.length_capped || attempt == MAX_TRIES {
+            break;
+        }
+        on_chunk("⏳ 本段提炼被中断，正在重试…");
+    }
+    Ok(best)
 }
 
 /// 剥离推理模型输出的思维链：去掉 <think>…</think> 块（含未闭合的残留），
@@ -699,6 +843,7 @@ fn is_retryable(e: &anyhow::Error) -> bool {
     s.contains("LLM 429")
         || s.contains("LLM 503")
         || s.contains("LLM 529")
+        || s.contains("LLM 返回空内容")
         || s.contains("Too Many Requests")
         || s.contains("Service Unavailable")
         || s.contains("overloaded")
@@ -713,6 +858,15 @@ fn is_retryable(e: &anyhow::Error) -> bool {
         || s.contains("connection error")
 }
 
+/// 连接压根没建起来（网络断、代理挂了、DNS 不通）。这类错误每试一次都要先耗光 connect_timeout，
+/// 而“等一等”并不会让断掉的线路自己好，故少试几轮、早点把真错误告诉用户。
+fn is_connect_failure(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("error sending request")
+        || s.contains("connection refused")
+        || s.contains("dns error")
+}
+
 /// 带退避重试的流式请求：遇限流/过载，指数退避（2/4/8s）后重试，最多 4 次。
 /// 重试间通过 `on_chunk` 回显等待提示。429 等错误在请求建连阶段返回，此时 acc 尚空，重试不会丢已显示内容。
 fn stream_chat_retry(
@@ -721,7 +875,7 @@ fn stream_chat_retry(
     api_key: &str,
     body: &serde_json::Value,
     on_chunk: &mut dyn FnMut(&str),
-) -> Result<String> {
+) -> Result<StreamOutcome> {
     const MAX_ATTEMPTS: u32 = 4;
     let mut attempt = 0u32;
     loop {
@@ -733,14 +887,17 @@ fn stream_chat_retry(
         match stream_chat(req, on_chunk) {
             Ok(s) => return Ok(s),
             Err(e) => {
-                if attempt < MAX_ATTEMPTS && is_retryable(&e) {
+                let max = if is_connect_failure(&e) { 2 } else { MAX_ATTEMPTS };
+                if attempt < max && is_retryable(&e) {
                     let wait = 1u64 << attempt; // 2 / 4 / 8 秒
+                    // {:#} 带出整条 error source 链：只打顶层的话永远只有一句「error sending request」，
+                    // 看不出是 TLS 被重置、连接超时还是对端断开，没法自助排查。
                     on_chunk(&format!(
-                        "⏳ 网络或接口波动（{}），{} 秒后自动重试（第 {}/{} 次）…",
+                        "⏳ 网络或接口波动（{:#}），{} 秒后自动重试（第 {}/{} 次，单次最长等 15 秒）…",
                         e,
                         wait,
                         attempt,
-                        MAX_ATTEMPTS - 1
+                        max - 1
                     ));
                     std::thread::sleep(std::time::Duration::from_secs(wait));
                     continue;

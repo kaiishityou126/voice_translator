@@ -17,7 +17,7 @@ fn default_asr_engine() -> String {
 }
 
 fn default_summary_max_context() -> usize {
-    10_000
+    30_000
 }
 
 fn default_tts_target_lang() -> String {

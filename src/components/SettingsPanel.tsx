@@ -219,7 +219,7 @@ function LlmEditModal({
           <input value={p.model} onChange={(e) => upd({ model: e.target.value })} placeholder="如：gpt-4o-mini" />
         </div>
         <div className="field">
-          <label>模型用途（决定它出现在哪个下拉）</label>
+          <label>模型用途</label>
           <div className="llm-caps">
             <label className="llm-cap">
               <input type="checkbox" checked={p.capTranslation} onChange={(e) => upd({ capTranslation: e.target.checked })} />
@@ -509,7 +509,7 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
           ))}
         </select>
         <p className="hint">
-          「✦ 提炼重点」用的模型，独立于翻译引擎（Google / 纯字幕也能提炼）；不指定就用翻译模型。
+          「✦ 提炼重点」用的模型，不指定则默认用翻译模型；建议选长文本理解更强的模型。
         </p>
       </div>
 
@@ -781,7 +781,7 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
 
       <div className="grid2">
         <div className="field">
-          <label>单次提炼上下文</label>
+          <label>每批提炼字数</label>
           <div className="input-suffix">
             <input
               type="text"
@@ -800,11 +800,11 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
       <InfoLine
         detail={
           <>
-            默认 <b>10k</b>。会话很长时会自动拆成几段提炼再合并：数字越大拆得越少、越连贯，但小模型吃太多会跑偏、丢内容；付费旗舰大模型可调到 30k+ 一次吃更多、更省请求。
+            弱模型（比如：免费模型）一次可提炼的字数会较小，<b>建议调到 10k</b>。会话很长时会自动拆成几段提炼再合并；强模型（比如：付费模型）一次可提炼的字数会更大，<b>默认 30k</b>，会话很长时也可一次完成，不用拆批。
           </>
         }
       >
-        控制每次喂给模型多少字，越大越连贯、小模型调高易跑偏
+        模型的强弱决定一次最多可提炼多少字，超出就自动拆批；
       </InfoLine>
       </>
       )}
@@ -850,13 +850,16 @@ export function SettingsPanel({ value, disabled, onChange }: Props) {
               ) : (
                 value.llmProfiles.map((p) => (
                   <div className="llm-row" key={p.id}>
-                    <div>
+                    <div className="llm-row-main">
                       <div className="llm-row-name">
                         {modelDisplayName(p, value.llmProfiles)}
                         <span className="llm-badge">{p.isLocal ? "Ollama" : "云端"}</span>
                       </div>
                       <div className="llm-row-sub">
-                        模型 {p.model || "—"} · {p.baseUrl}
+                        模型 {p.model || "—"}
+                      </div>
+                      <div className="llm-row-url">
+                        {p.baseUrl || "—"}
                       </div>
                     </div>
                     <div className="llm-caps">
