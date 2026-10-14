@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
-import { Play, Square, X, Minus, Plus } from "lucide-react";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { Play, Square, X, Minus, Plus, Check, Repeat, Volume2, Mic } from "lucide-react";
 import { SubtitleEvent, StatusEvent, OverlayConfig } from "../types";
 
 // 悬浮窗字号档位 → 缩放系数(悬浮窗可比主界面更醒目)
@@ -30,35 +30,43 @@ export function Overlay() {
     displayMode: "bilingual",
     overlayFontScale: "md",
     overlayOpacity: 0,
+    source: "loopback",
+    relayMode: false,
+    relayPassthrough: false,
   });
   // 刚被打开时先闪一下全背景色+按钮，再淡到设定透明度
   const [flash, setFlash] = useState(false);
   const flashTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    const unsubs: Array<() => void> = [];
+    // 收集 Promise<UnlistenFn>；cleanup 里 Promise.then 解绑，避免同步 cleanup 时列表还空导致的泄漏/重复注册。
+    const subs: Array<Promise<UnlistenFn>> = [];
     // id 守卫：流式回填会乱序到达，丢弃比当前更旧段落的迟到帧，避免新句被旧句覆盖
-    listen<SubtitleEvent>("subtitle", (e) =>
-      setSub((prev) => (prev && e.payload.id < prev.id ? prev : e.payload))
-    ).then((u) => unsubs.push(u));
-    listen<StatusEvent>("status", (e) => {
-      const s = e.payload.state;
-      if (s === "idle" || s === "error") setRunning(false);
-      else setRunning(true); // starting/listening/recognizing/translating
-    }).then((u) => unsubs.push(u));
-    listen<OverlayConfig>("overlay-config", (e) => setCfg(e.payload)).then((u) =>
-      unsubs.push(u)
+    subs.push(
+      listen<SubtitleEvent>("subtitle", (e) =>
+        setSub((prev) => (prev && e.payload.id < prev.id ? prev : e.payload))
+      )
     );
+    subs.push(
+      listen<StatusEvent>("status", (e) => {
+        const s = e.payload.state;
+        if (s === "idle" || s === "error") setRunning(false);
+        else setRunning(true); // starting/listening/recognizing/translating
+      })
+    );
+    subs.push(listen<OverlayConfig>("overlay-config", (e) => setCfg(e.payload)));
     // 主窗口通知「悬浮窗刚被打开」→ 闪现全背景色+按钮约 1.2s，再淡回设定透明度
-    listen("overlay-shown", () => {
-      setFlash(true);
-      if (flashTimer.current) window.clearTimeout(flashTimer.current);
-      flashTimer.current = window.setTimeout(() => setFlash(false), 1200);
-    }).then((u) => unsubs.push(u));
+    subs.push(
+      listen("overlay-shown", () => {
+        setFlash(true);
+        if (flashTimer.current) window.clearTimeout(flashTimer.current);
+        flashTimer.current = window.setTimeout(() => setFlash(false), 1200);
+      })
+    );
     // 挂载后向主窗口要一次当前配置（首次打开时主窗口还没主动下发过）
     emit("overlay-ready").catch(() => {});
     return () => {
-      unsubs.forEach((u) => u());
+      subs.forEach((p) => p.then((u) => u()));
       if (flashTimer.current) window.clearTimeout(flashTimer.current);
     };
   }, []);
@@ -84,6 +92,20 @@ export function Overlay() {
     emit("overlay-config-change", { overlayFontScale: next }).catch(() => {});
   };
 
+  // 输入模式标签 + 图标：与主页面顶栏保持一致（回灌 / 系统音频 / 麦克风）
+  const inputModeLabel = cfg.relayMode
+    ? "回灌"
+    : cfg.source === "loopback"
+    ? "系统音频"
+    : "麦克风";
+  const ModeIcon = cfg.relayMode ? Repeat : cfg.source === "loopback" ? Volume2 : Mic;
+  // 切「原声」：乐观翻转 + emit 给主窗（走与主页面「原声」按钮同一条 update 路径，含运行中热切/失败回退）
+  const togglePassthrough = () => {
+    const relayPassthrough = !cfg.relayPassthrough;
+    setCfg((c) => ({ ...c, relayPassthrough }));
+    emit("overlay-config-change", { relayPassthrough }).catch(() => {});
+  };
+
   return (
     <div
       className={`overlay${flash ? " is-flash" : ""}`}
@@ -91,6 +113,23 @@ export function Overlay() {
       style={ovStyle}
     >
       <div className="ov-ctrls ov-ctrls-left">
+        <div className="ov-mode" title="输入模式">
+          <ModeIcon size={13} strokeWidth={1.9} />
+          <span className="ov-mode-tag">{inputModeLabel}</span>
+          {cfg.relayMode && (
+            <button
+              className={`ov-raw${cfg.relayPassthrough ? " on" : ""}`}
+              title="对方听到：译文 / 你的原声（可运行中切换）"
+              aria-pressed={cfg.relayPassthrough}
+              onClick={togglePassthrough}
+            >
+              <span className="ov-raw-box">
+                {cfg.relayPassthrough && <Check size={10} strokeWidth={3} />}
+              </span>
+              原声
+            </button>
+          )}
+        </div>
         <div className="ov-seg" title="悬浮窗字号">
           {OV_SCALES.map((s) => (
             <button
@@ -124,7 +163,7 @@ export function Overlay() {
       <div className="ov-ctrls">
         {running ? (
           <button
-            className="ov-btn"
+            className="ov-btn ov-btn-stop"
             title="停止翻译"
             onClick={() => invoke("stop_translation").catch(() => {})}
           >

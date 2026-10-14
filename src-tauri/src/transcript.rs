@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-/// 一段会话记录（JSONL 每行一条）。speaker 预留给后续说话人分离，当前恒为 None。
+/// 一段会话记录（JSONL 每行一条）。speaker 为说话人分离的段内说话人号（None=未分离）。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
@@ -21,7 +21,7 @@ pub struct Segment {
     pub original: String,
     pub translated: String,
     #[serde(default)]
-    pub speaker: Option<String>,
+    pub speaker: Option<i32>,
 }
 
 /// transcripts 目录（不存在则创建）。
@@ -53,18 +53,32 @@ impl SessionWriter {
 
     /// 追加一段（一行 JSON）。文件首次写入时惰性创建。
     /// translated 传空串表示未成功翻译（提炼时会跳过空译文）。
-    pub fn append(&self, id: u64, ts: u128, original: &str, translated: &str) {
+    /// speaker 为说话人分离得到的段内说话人号（None=未分离）。
+    pub fn append(&self, id: u64, ts: u128, original: &str, translated: &str, speaker: Option<i32>) {
         let _g = self.lock.lock().unwrap();
         let seg = Segment {
             id,
             ts,
             original: original.to_string(),
             translated: translated.to_string(),
-            speaker: None,
+            speaker,
         };
-        if let Ok(line) = serde_json::to_string(&seg) {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.path) {
-                let _ = writeln!(f, "{}", line);
+        // 存档是核心持久化：磁盘满/权限/路径失效时不再静默吞错，至少打日志（否则译好的段无声丢失，比报错更糟）。
+        let line = match serde_json::to_string(&seg) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[transcript] 段序列化失败，丢弃 id={id}: {e}");
+                return;
+            }
+        };
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{}", line) {
+                    eprintln!("[transcript] 写入存档失败 {}（id={id}）: {e}", self.path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("[transcript] 打开存档失败 {}（id={id}）: {e}", self.path.display());
             }
         }
     }

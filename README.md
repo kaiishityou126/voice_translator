@@ -1,117 +1,203 @@
-# 语音翻译 · Voice Translator
+# 海星同传 · SeaStar Voice Translator
 
-实时语音翻译桌面应用：捕获**电脑系统音频**（或麦克风）→ 本地语音识别 → 翻译 → 双栏字幕实时显示。中 / 英 / 日 三语互译。
+<p align="center">
+  <img src="app-icon.png" width="120" alt="SeaStar Voice Translator" />
+</p>
 
-> **Windows 端到端可用**：系统音频→本地识别→翻译→双栏字幕 + 悬浮窗。已含 RNNoise 降噪、Silero VAD、多种翻译引擎（含免 key）、模型按需下载、会话重点提炼、应用图标、安装包。macOS（ScreenCaptureKit 系统音频 + 麦克风）与 Linux（PulseAudio/PipeWire monitor + 麦克风）采集代码已补全，待真机验证；代码签名需自备证书——见下方路线图。
+**实时语音翻译桌面应用 · Real-time speech-translation desktop app**
 
-> **隐私**：音频全程不出本机，只有识别出的**文本**发往翻译接口。
+[English](#english) · [中文](#中文)
 
-## 架构
+---
 
-```
-系统音频(WASAPI 环回, 48k) ──► 降噪(RNNoise, 可选) ──► /3 重采样 48k→16k
-                                                          │
-                                                          ▼
-                                          VAD 切段(Silero / 能量门限)
-                                                          │ [seg channel, 有界]
-                                                          ▼
-                              sherpa-onnx 进程内识别(SenseVoice / Qwen3-ASR, 纯 CPU)
-                                                          │ 原文先 emit [txt channel, 有界]
-                                                          ▼
-                              翻译(OpenAI 兼容 / Ollama / Google 免费 / 纯字幕)
-                                                          │ 译文回填同一 id
-                                                          ▼
-                                          Tauri event ──► React 双栏字幕 + 悬浮窗
-```
+## English
 
-- **框架**：Tauri 2.x（Rust 后端 + React 19 / TS 前端，WebView2）
-- **采集**：Windows 用 `wasapi` 默认 Render 设备 loopback（48kHz，autoconvert）；静音缓冲(SILENT)清零防污染。平台无关处理（降噪→抽取→切段）抽成 `Processor` 共享；macOS / Linux 采集代码已补全但待真机验证（见 [capture.rs](src-tauri/src/capture.rs)）
-- **降噪**：可开关。RNNoise（[nnnoiseless](src-tauri/src/denoise.rs)）在 48kHz 降噪 → 自写 /3 FIR 抽取到 16kHz 喂识别引擎
-- **VAD**：默认 **Silero VAD**（sherpa-onnx 内置，ML 切分更准）；可关闭回退到零依赖的能量门限（[segmenter.rs](src-tauri/src/segmenter.rs)）。分段长度按识别引擎自适应（SenseVoice 偏短低延迟、Qwen3 偏长保上下文）
-- **ASR**：**sherpa-onnx 静态链接、进程内离线识别**（无 sidecar、无 HTTP，音频不出本机），纯 CPU 推理。两种引擎可选（[asr.rs](src-tauri/src/asr.rs)）：
-  - **SenseVoice**（默认，快）：CTC 模型，延迟低、模型小（int8，约 240MB），支持 zh/en/ja/ko/yue；日常字幕够用，专名准确度一般
-  - **Qwen3-ASR**（精准）：LLM 解码，延迟略高、模型大（约 940MB）；专名/同音词更准
-- **流水线**：采集→识别→翻译**三线程并行**，有界 mpsc 通道串联——原文识别出即刻显示，译文随后回填同一条字幕（[pipeline.rs](src-tauri/src/pipeline.rs)）
-- **翻译**：多引擎可选（[translate.rs](src-tauri/src/translate.rs)）——**OpenAI 兼容**(需 key，可指向 OpenAI/DeepSeek/通义/Kimi) / **Ollama**(本地，无 key，需装 Ollama 并拉模型) / **Google 免费**(非官方 gtx 端点，无 key) / **纯字幕**(不翻译，无 key，只出原文)
-- **会话重点**：一键把本次会话译文用 LLM 提炼成结构化重点（[translate.rs](src-tauri/src/translate.rs) `summarize`），支持手动编辑与重新提炼
+Turn any sound playing on your PC — meetings, videos, live streams, podcasts — into live **bilingual subtitles**, and even speak your translation **back into a meeting**. Speech recognition runs **locally on your machine**; only the recognized **text** is sent to the translation service.
 
-## 运行（开发）
+> **Windows: ready to use. macOS: capture & relay code written, pending real-hardware testing.**
 
-前置：Node 18+、Rust(stable-msvc)、WebView2（Win11 自带）。
+### Highlights
 
-**识别模型不用手动下**——首次「开始」时按所选引擎自动下载到 app 数据目录（`%APPDATA%\com.administrator.voicetranslator\models`），带进度条。仓库内已含 VAD 所需的 `src-tauri/sidecar/models/silero_vad.onnx`（约 2.2MB，随安装包打包）。
+- 🎧 **Translate any system audio** — not tied to one app. Works with Zoom / Teams / Meet, videos, live streams, anything playing on your PC (system-audio loopback), or your microphone.
+- 🔒 **Privacy first** — audio never leaves your machine; only recognized text goes to the translation API. Pair it with a local Ollama model for **zero data leaving your PC**.
+- 🗣️ **Two-way voice relay** — speak your language and have it translated and *spoken* into the meeting so others hear their language (while you read theirs). ★ the standout feature.
+- 📝 **Live bilingual subtitles** + a draggable, always-on-top **overlay** window.
+- 🌐 **Multiple translation engines**, including no-key options — OpenAI-compatible (OpenAI / DeepSeek / Qwen / Kimi), local **Ollama** (no key), free **Google** (no key), or **subtitles-only** (no translation).
+- 🧠 **One-click session summary** (LLM) + **history** review.
+- 🎯 **Speaker voiceprint gate** — during relay, only let *your* voice through and drop nearby bystanders.
+
+### Who it's for
+
+Windows users who want cross-app, privacy-friendly, optionally-offline, real-time translation of foreign-language audio — and optionally two-way voice relay for cross-language meetings.
+
+### System requirements (minimum)
+
+- **OS:** Windows 10 / 11 (64-bit), with the WebView2 runtime (built into Windows 11). *macOS code is written but unverified on real hardware, so it currently suits Windows users only.*
+- **CPU:** x86-64 (Intel / AMD). Recognition and speech synthesis run **in real time on the CPU** — **4+ cores recommended**; for **two-way relay** (listening + speaking + synthesis at once), **6+ cores recommended**. *(Windows on ARM is not supported.)*
+- **RAM:** **8 GB+**; 16 GB recommended for the Qwen3 model or two-way relay.
+- **Disk:** about **2 GB** free for the on-demand recognition / TTS models.
+- **GPU:** none required — CPU only.
+- **Network:** needed for cloud translation and the first-time model download; choose local Ollama for offline translation.
+
+### Run from source
+
+Prerequisites: Node 18+, Rust (stable-msvc), WebView2 (built into Windows 11).
 
 ```powershell
 npm install
-npm run tauri dev
+npm run tauri dev      # run in dev mode
+npm run tauri build    # build installers (NSIS .exe / MSI)
 ```
 
-首次「开始」：若所选引擎的模型未下载会先下载（进度条，SenseVoice ≈240MB / Qwen3 ≈940MB），再加载识别器。在设置里选翻译引擎：云 API 填 key；想免 key 就选 **Google 免费** 或 **纯字幕**。
+### Quick start
 
-## 关键设计点
+1. **Install** the app. (Unsigned build — see [Install notes](#install-notes-unsigned) to get past the OS warning.)
+2. **Open it and pick a translation engine** in Settings: a cloud API → paste your key; or a no-key option (Google / subtitles-only / local Ollama).
+3. **Choose the source & target language.**
+4. **Click Start.** On first run, the speech-recognition model downloads automatically (with a progress bar).
+5. **Play foreign-language audio** (or speak into your mic) → read the live bilingual subtitles. Toggle the overlay for an always-on-top view.
 
-- **loopback 实现**：打开默认 **Render** 设备后，以 `Direction::Capture` 初始化 → WASAPI 置 `AUDCLNT_STREAMFLAGS_LOOPBACK`。这是 wasapi 0.23 的环回方式。
-- **sherpa-onnx 进程内、静态链接**：识别器常驻进程内存，无 sidecar 进程 / HTTP，免去每段重载与跨进程开销；模型静态链接库随程序分发，运行期无需额外 DLL。
-- **三线程并行流水线**：采集→切段→`seg` channel→识别线程→(原文先 emit)→`txt` channel→翻译线程→回填。段 N+1 的识别与段 N 的翻译并行，翻译不阻塞识别；每段用自增 id，前端按 id 回填，顺序仍有保证。通道有界，过载时丢最旧音频 / 标记翻译跳过，保证实时不退化。
-- **分段长度按引擎自适应**：SenseVoice 成本平、长片段反而掉点 → 用短段降延迟；Qwen3 需要上下文降低幻觉 → 用长段（[segmenter.rs](src-tauri/src/segmenter.rs) `SegLimits::for_engine`）。
+### Two-way voice relay (meetings)
 
-## 模型与下载
+Speak your language → the other side hears it in theirs; they speak → you read subtitles. This needs a virtual audio cable so the app can "speak" into the meeting.
 
-识别模型**首次使用时自动下载**到 app 数据目录（`download_model` 命令 + `model-progress` 进度事件，[asr.rs](src-tauri/src/asr.rs)），无需手动下：
+1. Install **VB-CABLE** (a free virtual audio device).
+2. In the app, turn on **voice relay**, then set **your language / the other side's language / voice**.
+3. In your meeting software, set the **microphone to `CABLE Output`**.
+4. *(Optional)* **Enroll your voiceprint** and enable the speaker gate so people nearby don't get relayed.
+5. **Start.** Your speech is translated and played into the meeting; what others say shows up as bilingual subtitles.
 
-| 引擎 | 模型 | 体积 | 说明 |
+> Design rationale (anti-echo-loop, etc.) lives in [docs/语音翻译回灌会议-设计方案.md](docs/语音翻译回灌会议-设计方案.md).
+
+### Install notes (unsigned)
+
+This is free, open-source software without a paid code-signing certificate, so your OS will warn on first install. This is normal for any unsigned app — it says nothing about whether the software is safe.
+
+- **Windows (SmartScreen):** click **More info** → **Run anyway**.
+
+### Which translation engine?
+
+Translation is done by the engine you pick; quality and speed differ here:
+
+| Engine | Needs | Notes | Best for |
 |---|---|---|---|
-| SenseVoice（默认） | `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09` (int8) | ≈237MB | CTC，快，支持 zh/en/ja/ko/yue |
-| Qwen3-ASR | Qwen3-ASR-0.6B (int8) | ≈940MB | LLM 解码，专名更准，延迟略高 |
+| **OpenAI-compatible** | API key | Point it at GPT / DeepSeek / Qwen / Zhipu / Kimi — **most accurate, best across languages** | Quality |
+| **Local Ollama** | Ollama + a model | **Offline, nothing leaves your PC**; quality scales with model size | Privacy / offline |
+| **Google (free)** | nothing | No key, wide coverage; unofficial endpoint **may rate-limit** | Just works |
+| **Subtitles-only** | nothing | No translation, shows the recognized text | Transcription only |
 
-VAD 模型 `silero_vad.onnx`（约 2.2MB）已随仓库与安装包打包，无需下载。
+**Free & real-time pick:** point the OpenAI-compatible engine at **Zhipu GLM-4-Flash** (free — register at [open.bigmodel.cn](https://open.bigmodel.cn/) for a key). It's fast — the translation usually shows up within about a second of you finishing a sentence, which is plenty for live subtitles. Step up to GPT / DeepSeek etc. when you want higher quality.
 
-## 打包 / 发布
+> **Avoid reasoning models** (names with `o1` / `o3` / `R1` / `QwQ` / `reasoner` — they "think" before replying and lag your subtitles). Just **pick a fast model by name**: `Flash` / `mini` / `turbo` / `chat` / `V3` (e.g. GLM-4-Flash, deepseek-chat, qwen-turbo). These don't think by default — no extra settings needed.
+
+### Good to know
+
+- **Recognition (which spoken languages it understands) depends on the engine:** **SenseVoice** (default, fast) handles Chinese / English / Japanese / Korean / Cantonese (5); **Qwen3-ASR** (more accurate) handles ~30 languages, plus many Chinese dialects.
+- **Model sizes** (downloaded on first use): SenseVoice ≈237 MB (fast) / Qwen3-ASR ≈940 MB (more accurate) / Kokoro TTS ≈310 MB (relay). Everything runs on CPU.
+
+### Feedback & contributing
+
+Run into a problem or have an idea to make it better? Please open an [issue](../../issues). Want it on **macOS**? Speak up too — the code is written and just needs testing on real hardware. Knowing people actually use it is what keeps me motivated to maintain and improve this project.
+
+For architecture, the module map, and dev conventions, see **[AGENTS.md](AGENTS.md)**.
+
+### License
+
+Released under the [MIT License](LICENSE).
+
+---
+
+## 中文
+
+把电脑上正在播放的**任何声音**——会议、视频、直播、播客——变成实时**双语字幕**,甚至能把你的翻译"说"回**会议里**。语音识别**在本机完成**,只有识别出的**文本**才发往翻译服务。
+
+> **Windows：开箱可用。macOS：代码已写好,待真机验证。**
+
+### 特色亮点
+
+- 🎧 **翻译任何系统声音** —— 不绑定某个软件。Zoom / Teams / 腾讯会议、视频、直播,凡是电脑在放的声音(系统音频环回)或你的麦克风,都能翻。
+- 🔒 **隐私优先** —— 音频全程不出本机,只有识别出的文本发往翻译接口;配本地 Ollama 可做到**数据零外发**。
+- 🗣️ **双向语音回灌** —— 你说母语,应用自动译成对方的语言,再用语音替你"讲"进会议,对方直接听翻译完的语言;对方说话,你这边看双语字幕。**就像随身带了个同传。** ★ 最独特的能力。
+- 📝 **实时双语字幕** + 可拖动、置顶的**悬浮窗**。
+- 🌐 **多种翻译引擎**,含免 key —— OpenAI 兼容(OpenAI / DeepSeek / 通义 / Kimi)、本地 **Ollama**(无 key)、**Google 免费**(无 key)、**纯字幕**(不翻译)。
+- 🧠 **会话重点一键提炼**(LLM)+ **历史回看**。
+- 🎯 **说话人声纹门控** —— 回灌时只放行你本人,挡掉旁边的人。
+
+### 适合谁
+
+Windows 用户,想要**跨应用、重隐私、可离线**地实时翻译外语音频;还可以双向语音回灌,用于跨语言开会。
+
+### 系统配置(最低)
+
+- **操作系统**：Windows 10 / 11（64 位）,需 WebView2 运行时（Win11 自带）。*macOS 代码已写好但未真机验证,暂只适合 Windows 用户。*
+- **处理器**:x86-64(Intel / AMD)。识别与语音合成为**纯 CPU 实时推理** —— 建议 **4 核以上**;开**双向回灌**(同时听 + 说 + 合成三路并发)建议 **6 核以上**。*(不支持 Windows on ARM。)*
+- **内存**:**8GB 以上**;用 Qwen3 大模型或双向回灌建议 16GB。
+- **硬盘**:约 **2GB** 可用空间(按需下载的识别 / TTS 模型)。
+- **显卡**:无需独显,纯 CPU 运行。
+- **网络**:用云 API 翻译需联网,首次需联网下模型;选本地 Ollama 可离线翻译。
+
+### 从源码运行
+
+前置:Node 18+、Rust(stable-msvc)、WebView2(Win11 自带)。
 
 ```powershell
-npm run tauri build   # 产物在 src-tauri/target/release/bundle/（NSIS .exe + MSI）
+npm install
+npm run tauri dev      # 开发运行
+npm run tauri build    # 打包安装包(NSIS .exe / MSI)
 ```
 
-- 识别模型不打包，安装包仅含程序 + VAD 模型 + 前端；用户首次运行按需下载识别模型。
-- **代码签名**：需自备代码签名证书。Windows 在 `tauri.conf.json` 的 `bundle.windows.certificateThumbprint`（+ `signCommand` 或 `timestampUrl`）配置；无证书则产物为**未签名**安装包（用户安装时 SmartScreen 会警告）。
+### 快速开始
 
-## 安装时的安全提示（未签名说明）
+1. **安装**(未签名版,过系统警告见 [安装说明](#安装说明未签名))。
+2. **打开,在设置里选翻译引擎**:云 API 填 key;或选免 key 的 Google / 纯字幕 / 本地 Ollama。
+3. **选源语言和目标语言。**
+4. **点「开始」。** 首次会自动下载识别模型(带进度条)。
+5. **播放外语音频**(或对着麦克风说)→ 看实时双语字幕。想置顶就开悬浮窗。
 
-本项目是**免费开源软件，未购买代码签名证书**，因此各平台首次安装会弹安全提示。这与软件本身是否安全无关——操作系统对任何未签名应用都会这样提示。绕过方法如下：
+### 回灌·双向同传(开会用)
 
-**Windows（SmartScreen）**
+你说母语 → 对方听到他的语言;对方说话 → 你读字幕。这需要一个虚拟声卡,好让应用能"说"进会议。
 
-双击安装包若出现「Windows 已保护你的电脑 / Windows protected your PC」：
+1. 安装 **VB-CABLE**(免费虚拟声卡)。
+2. 应用里打开**语音回灌**,设好**我的语言 / 对方语言 / 音色**。
+3. 会议软件里把**麦克风设成 `CABLE Output`**。
+4. *(可选)* **登记你的声纹**并开启说话人门控,挡掉旁边的人被一起回灌。
+5. **开始。** 你说的话会被译成对方语言并"说"进会议;对方说的话显示为双语字幕。
 
-1. 点蓝字 **更多信息 / More info**
-2. 再点 **仍要运行 / Run anyway**
+> 设计原理(防音频回环等)见 [docs/语音翻译回灌会议-设计方案.md](docs/语音翻译回灌会议-设计方案.md)。
 
-**macOS（Gatekeeper）**
+### 安装说明(未签名)
 
-DMG 未签名 / 未公证，安装后首次打开可能提示「无法打开，因为无法验证开发者」。任选其一：
+本项目是**免费开源、未购买代码签名证书**的软件,首次安装系统会弹安全提示——这对任何未签名应用都一样,与软件是否安全无关。
 
-- **右键点 App → 打开 → 在弹窗里再点「打开」**（推荐，最简单）；或
-- 终端去掉隔离属性后再打开：
+- **Windows(SmartScreen):** 点**更多信息** → **仍要运行**。
 
-  ```bash
-  xattr -dr com.apple.quarantine "/Applications/语音翻译.app"
-  ```
+### 选哪个翻译引擎
 
-**Linux**
+翻译由你选的引擎完成,质量与速度差别主要在这里:
 
-`.AppImage` 下载后需加可执行权限：`chmod +x 语音翻译*.AppImage`，再双击或命令行运行；`.deb` 用 `sudo dpkg -i 语音翻译*.deb` 安装。
+| 引擎 | 需要 | 特点 | 适合 |
+|---|---|---|---|
+| **OpenAI 兼容** | API key | 可指向 GPT / DeepSeek / 通义 / 智谱 / Kimi 等,**翻译最准、多语最稳** | 追求质量 |
+| **本地 Ollama** | 装 Ollama + 拉模型 | **离线、零外发**;质量看模型大小,小模型对冷门语言偏弱 | 重隐私 / 离线 |
+| **Google 免费** | 无 | 免 key、覆盖广;非官方接口**可能限流** | 随手就用 |
+| **纯字幕** | 无 | 不翻译,只显示识别原文 | 只要转写 |
 
-> 想彻底消除 Windows 警告，开源项目可申请 [SignPath Foundation](https://signpath.org/) 的**免费**代码签名；macOS 公证需 Apple 开发者账号（$99/年）。详见路线图。
+**省钱又要实时的推荐:** 用 OpenAI 兼容接口指向**智谱 GLM-4-Flash**（免费,在[智谱开放平台](https://open.bigmodel.cn/)注册拿 key）—— 速度快,一般说完 1 秒内就出译文,日常字幕完全够用;想要更高质量再换 GPT / DeepSeek 等更强的模型。
 
-## 路线图
+> **别选推理模型**（名字带 `o1` / `o3` / `R1` / `QwQ` / `reasoner` 的,出答案前要先“想”很久,会拖慢字幕）。直接**按模型名选个“快的”**:`Flash` / `mini` / `turbo` / `chat` / `V3`（如 GLM-4-Flash、deepseek-chat、qwen-turbo）—— 这些默认不思考,应用里填对模型名即可,无需其它设置。
 
-- **P1（已完成）** Windows 端到端：系统音频 → 识别 → 翻译 → 字幕
-- **准确/速度优化（已完成）**
-  - 准确：RNNoise 降噪（48k 采集→降噪→16k，可开关）；**Silero VAD** 语音切分（sherpa-onnx 内置，可开关，失败回退能量门限）；源语言可固定（中/英/日/韩/粤，短片段比 auto 准）；静音缓冲清零；幻觉与套话熔断；两种识别引擎（SenseVoice 快 / Qwen3 精准）可切换
-  - 速度：采集/识别/翻译三线程并行（原文先出、译文回填）；纯 CPU 推理（SenseVoice int8，`num_threads=4`）；分段长度按引擎自适应收紧延迟
-  - 鲁棒：播放停止时兜底收尾半句（不卡半句）；采集→识别→翻译全程有界队列，过载时丢最旧音频 / 标记翻译跳过，保证实时不退化
-  - 翻译引擎多选：OpenAI 兼容 / 本地 Ollama(无 key) / Google 免费(无 key) / 纯字幕(无 key)，免 key 也能用
-  - 体验：悬浮字幕窗（独立透明置顶窗口，实时显示最新原文+译文，可拖动，主窗口一键开关）；会话重点一键提炼（LLM，可编辑/重提炼）；历史导出为 txt（带时间戳的原文+译文）
-  - 打包：应用图标（「译」字）；识别模型**按需下载**到 app 数据目录（带进度），安装包仅含程序 + VAD 模型；`tauri build` 出 Windows 安装包（NSIS/MSI）
-- **P2（待做）** DeepFilterNet3 深度降噪（更强，替 RNNoise）；SRT 带时轴字幕导出；多说话人分离
-- **P3** macOS / Linux 采集真机验证（已搭好 cfg 隔离脚手架 + 共享 Processor，需接 ScreenCaptureKit / PulseAudio + 权限引导）；代码签名（需自备证书）+ macOS 打包
+### 使用小贴士
+
+- **识别语言(听懂哪些话)看引擎:** **SenseVoice**(默认、快)可识别中 / 英 / 日 / 韩 / 粤 5 种;**Qwen3-ASR**(更准)可识别约 30 种语言,另含多种中文方言。
+- **模型体积**(首次使用自动下载):SenseVoice ≈237MB(快)/ Qwen3-ASR ≈940MB(更准)/ Kokoro TTS ≈310MB(回灌用)。全部纯 CPU 运行。
+
+### 反馈与参与
+
+如果你在使用中遇到问题、或者有更好的想法,欢迎到 [Issues](../../issues) 提出来。想在 **macOS** 上用的朋友也欢迎冒个泡 —— 代码已经写好,只差真机调试。**有人在用,我就更有动力把这个项目持续维护、做得更好。**
+
+想了解架构、模块地图与开发约定,见 **[AGENTS.md](AGENTS.md)**。
+
+### 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。

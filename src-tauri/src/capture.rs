@@ -1,6 +1,6 @@
 //! 音频采集（按平台分发）：
-//! - Windows：WASAPI 环回(系统音频) / 默认输入(麦克风)
-//! - macOS：脚手架——ScreenCaptureKit(系统音频) / cpal(麦克风)，待在 Mac 上完成
+//! - Windows：WASAPI 环回(系统音频) / 默认输入(麦克风) —— 已验证可用
+//! - macOS：ScreenCaptureKit(系统音频) / cpal(麦克风) —— 代码完整，待真机验证
 //!
 //! 平台无关的处理（降噪 → 48k→16k 抽取 → 切段 → 有界发送）抽成 `Processor` 共享，
 //! 各平台只负责拿到「48k 单声道 f32」喂进来。
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 use crate::denoise::{Decimator3, Denoiser};
-use crate::segmenter::{SegLimits, Segmenter};
+use crate::segmenter::{CutReason, SegLimits, Segmenter};
 
 const TARGET_RATE: usize = 16_000; // 喂给 SenseVoice
 const CAPTURE_RATE: usize = 48_000; // 采集 + 降噪工作采样率
@@ -22,7 +22,7 @@ struct Processor {
     segmenter: Segmenter,
     clean48: Vec<f32>,
     mono16: Vec<f32>,
-    segments: Vec<Vec<f32>>,
+    segments: Vec<(Vec<f32>, CutReason)>,
     vad_kind: &'static str, // "silero" / "energy"，用于上报实际生效的 VAD
 }
 
@@ -71,7 +71,7 @@ impl Processor {
     }
 
     /// 喂入 48k 单声道；切出的段经 seg_tx 发送。返回 false = 下游已断开，应停止采集。
-    fn feed(&mut self, mono48: &[f32], seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn feed(&mut self, mono48: &[f32], seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         self.clean48.clear();
         if self.denoise {
             self.denoiser.process(mono48, &mut self.clean48);
@@ -85,7 +85,7 @@ impl Processor {
     }
 
     /// 无新数据且有未收尾段时调用：强制收尾（播放停止防卡半句）。
-    fn idle_flush(&mut self, seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn idle_flush(&mut self, seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         if self.segmenter.has_open() {
             self.segmenter.flush(&mut self.segments);
         }
@@ -96,7 +96,7 @@ impl Processor {
         self.segmenter.has_open()
     }
 
-    fn drain(&mut self, seg_tx: &SyncSender<Vec<f32>>) -> bool {
+    fn drain(&mut self, seg_tx: &SyncSender<(Vec<f32>, CutReason)>) -> bool {
         for seg in self.segments.drain(..) {
             match seg_tx.try_send(seg) {
                 Ok(()) => {}
@@ -143,7 +143,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         init_com()?;
@@ -182,7 +182,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc = Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         // 上报实际生效的 VAD（release/安装态看不到日志，靠它在 UI 里观测）
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
         let mut mono48 = Vec::<f32>::with_capacity(CAPTURE_RATE);
@@ -241,6 +248,59 @@ mod platform {
             "microphone" => enumerator.get_default_device(&Direction::Capture)?,
             _ => enumerator.get_default_device(&Direction::Render)?,
         };
+        Ok(())
+    }
+
+    /// 原声直通采集：麦克风原始 48k 单声道帧连续发往 frame_tx（不降噪/不切段/不识别）。
+    pub fn raw_mic_thread(
+        stop: Arc<AtomicBool>,
+        frame_tx: SyncSender<Vec<f32>>,
+        _app: AppHandle,
+    ) -> Result<()> {
+        init_com()?;
+        let enumerator = DeviceEnumerator::new()?;
+        let device = enumerator.get_default_device(&Direction::Capture)?;
+        let mut audio_client = device.get_iaudioclient()?;
+        let desired_format = WaveFormat::new(32, 32, &SampleType::Float, CAPTURE_RATE, 2, None);
+        let blockalign = desired_format.get_blockalign() as usize;
+        let (_def_time, min_time) = audio_client.get_device_period()?;
+        let mode = StreamMode::EventsShared {
+            autoconvert: true,
+            buffer_duration_hns: min_time,
+        };
+        audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
+        let h_event = audio_client.set_get_eventhandle()?;
+        let capture_client = audio_client.get_audiocaptureclient()?;
+        audio_client.start_stream()?;
+        let mut byte_queue: VecDeque<u8> = VecDeque::with_capacity(blockalign * CAPTURE_RATE);
+        while !stop.load(Ordering::Relaxed) {
+            let frames = byte_queue.len() / blockalign;
+            if frames > 0 {
+                let mut mono48 = Vec::<f32>::with_capacity(frames);
+                for _ in 0..frames {
+                    let l = pop_f32(&mut byte_queue);
+                    let r = pop_f32(&mut byte_queue);
+                    mono48.push((l + r) * 0.5);
+                }
+                match frame_tx.try_send(mono48) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {} // 丢弃一帧保持实时
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        audio_client.stop_stream().ok();
+                        return Ok(());
+                    }
+                }
+            }
+            let before = byte_queue.len();
+            let info = capture_client.read_from_device_to_deque(&mut byte_queue)?;
+            if info.flags.silent {
+                for b in byte_queue.iter_mut().skip(before) {
+                    *b = 0;
+                }
+            }
+            let _ = h_event.wait_for_event(200);
+        }
+        audio_client.stop_stream().ok();
         Ok(())
     }
 }
@@ -313,7 +373,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         let silero_model = if use_silero {
@@ -327,8 +387,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         match source {
@@ -554,6 +620,73 @@ mod platform {
             _ => bail!("不支持的来源: {}", source),
         }
     }
+
+    /// 原声直通采集：麦克风原始 48k 单声道帧连续发往 frame_tx（不降噪/不切段/不识别）。
+    pub fn raw_mic_thread(
+        stop: Arc<AtomicBool>,
+        frame_tx: SyncSender<Vec<f32>>,
+        _app: AppHandle,
+    ) -> Result<()> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("未找到麦克风"))?;
+        let config: cpal::StreamConfig = device.default_input_config()?.into();
+        let src_rate = config.sample_rate.0;
+        let channels = config.channels as usize;
+
+        let (raw_tx, raw_rx) = channel::<Vec<f32>>();
+        let err_fn = |e| eprintln!("[capture] cpal 输入流错误: {}", e);
+        let stream = match config.channels {
+            1 => {
+                let tx = raw_tx.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let _ = tx.send(data.to_vec());
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            _ => {
+                let tx = raw_tx.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        downmix_send(data, channels, &tx);
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+        };
+        drop(raw_tx);
+        stream.play()?;
+
+        let mut resampler = Resampler::new(src_rate);
+        let mut mono48 = Vec::<f32>::with_capacity(CAPTURE_RATE);
+        while !stop.load(Ordering::Relaxed) {
+            match raw_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(chunk) => {
+                    mono48.clear();
+                    if src_rate == CAPTURE_RATE as u32 {
+                        mono48.extend_from_slice(&chunk);
+                    } else {
+                        resampler.process(&chunk, &mut mono48);
+                    }
+                    match frame_tx.try_send(mono48.clone()) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {} // 丢弃一帧保持实时
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
 }
 
 // ======================== Linux：麦克风(cpal) + 系统音频(PipeWire/PulseAudio monitor) ========================
@@ -620,7 +753,7 @@ mod platform {
         silence_ms: u64,
         limits: SegLimits,
         stop: Arc<AtomicBool>,
-        seg_tx: SyncSender<Vec<f32>>,
+        seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         app: AppHandle,
     ) -> Result<()> {
         let silero_model = if use_silero {
@@ -634,8 +767,14 @@ mod platform {
         } else {
             None
         };
-        let mut proc =
-            Processor::new(denoise, use_silero, silero_model, energy_threshold, silence_ms, limits);
+        let mut proc = Processor::new(
+            denoise,
+            use_silero,
+            silero_model,
+            energy_threshold,
+            silence_ms,
+            limits,
+        );
         let _ = app.emit("engine-info", serde_json::json!({ "vad": proc.vad_kind() }));
 
         let host = cpal::default_host();
@@ -836,7 +975,7 @@ mod platform {
         _silence_ms: u64,
         _limits: crate::segmenter::SegLimits,
         _stop: Arc<AtomicBool>,
-        _seg_tx: SyncSender<Vec<f32>>,
+        _seg_tx: SyncSender<(Vec<f32>, crate::segmenter::CutReason)>,
         _app: tauri::AppHandle,
     ) -> Result<()> {
         let _ = source;
@@ -849,3 +988,16 @@ mod platform {
 }
 
 pub use platform::{capture_thread, probe};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub use platform::raw_mic_thread;
+
+/// 非 Windows/macOS：原声直通未实现（回灌播放这些平台也未支持）。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn raw_mic_thread(
+    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _frame_tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    _app: tauri::AppHandle,
+) -> anyhow::Result<()> {
+    anyhow::bail!("当前平台未实现原声直通采集")
+}
